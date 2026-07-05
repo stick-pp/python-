@@ -1,0 +1,28 @@
+__pycache__/
+.codex/
+
+# Local WRDS data extracts. Keep these outside Git history.
+2.csv
+ajex.csv
+
+# Generated outputs.
+report_skinner_2008.pdf
+skinner_2008_outputs/
+shared_artifacts/
+
+# Git worktrees created for task isolation.
+worktrees/
+
+# Common temporary files.
+*.tmp
+*.bak
+*.log
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.out
+*.run.xml
+*.xdv
