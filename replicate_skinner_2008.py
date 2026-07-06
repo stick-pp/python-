@@ -1,12 +1,5 @@
 from __future__ import annotations
 
-import math
-import os
-import shutil
-import subprocess
-import tempfile
-import textwrap
-import time
 from pathlib import Path
 
 import numpy as np
@@ -18,26 +11,20 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
 
-import statsmodels.api as sm
-
 
 # ---------------------------------------------------------------------------
 # User-facing configuration
 # ---------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
+PROJECT_DIR = BASE_DIR.parent.parent
+SHARED_PYTHON_OUT = PROJECT_DIR / "shared_artifacts" / "python_out"
 MAIN_CSV = BASE_DIR / "2.csv"
 AJEX_CSV = BASE_DIR / "ajex.csv"
-REPORT_PDF = BASE_DIR / "report_skinner_2008.pdf"
-OUTPUT_DIR = BASE_DIR / "skinner_2008_outputs"
-REPORT_TEX = OUTPUT_DIR / "report_skinner_2008.tex"
-ELEGANT_CLASS = BASE_DIR / "elegantpaper.cls"
-
-# If Stata is installed but not on PATH, paste the executable path here, e.g.
-# STATA_EXE = r"C:\Program Files\Stata18\StataMP-64.exe"
-STATA_EXE = r"E:\downloading\stata\stata18\StataMP-64.exe"
-
-RUN_STATA_IF_AVAILABLE = True
+CCM_LINK_CSV = BASE_DIR / "CCM Link Table.csv"
+CRSP_DSE_NAMES_CSV = BASE_DIR / "crsp_dse_names.csv"
+PAST_STOCK_RETURN_CSV = BASE_DIR / "Past stock return.csv"
+OUTPUT_DIR = SHARED_PYTHON_OUT
 
 
 # ---------------------------------------------------------------------------
@@ -65,11 +52,11 @@ GROUP_NAMES = {
 }
 
 GROUP_NAMES_CN = {
-    1: "Group I: 不支付股利且不回购",
-    2: "Group II: 经常支付股利且经常回购",
-    3: "Group III: 仅偶尔回购",
-    4: "Group IV: 仅经常回购",
-    5: "Group V: 仅经常支付股利",
+    1: "Group I: Non-payers",
+    2: "Group II: Regular dividends and regular repurchases",
+    3: "Group III: Occasional repurchases only",
+    4: "Group IV: Regular repurchases only",
+    5: "Group V: Dividend-only regular payers",
 }
 
 PUBLISHED_GROUP_COUNTS = {
@@ -129,22 +116,6 @@ def safe_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce")
 
 
-def sig_marker(p_value: float) -> str:
-    if pd.isna(p_value):
-        return ""
-    if p_value < 0.01:
-        return "*"
-    if p_value < 0.05:
-        return "^"
-    return ""
-
-
-def fmt_coef(coef: float, se: float, p_value: float) -> str:
-    if pd.isna(coef):
-        return ""
-    return f"{coef:.2f}{sig_marker(p_value)}\n({se:.2f})"
-
-
 def fmt_pct(value: float) -> str:
     if pd.isna(value):
         return ""
@@ -170,12 +141,16 @@ def fmt_frac(value: float) -> str:
     return f"{value:.3f}"
 
 
-def wrap_text(text: str, width: int = 105) -> str:
-    return "\n".join(textwrap.wrap(text, width=width))
-
-
 def sum_observed(series: pd.Series) -> float:
     return series.sum(min_count=1)
+
+
+def place_xaxis_at_zero(ax: plt.Axes) -> None:
+    ax.spines["bottom"].set_position(("data", 0))
+    ax.spines["bottom"].set_visible(True)
+    ax.spines["top"].set_visible(False)
+    ax.xaxis.set_ticks_position("bottom")
+    ax.xaxis.set_label_position("bottom")
 
 
 def assert_unique_firm_year(df: pd.DataFrame, context: str) -> None:
@@ -195,14 +170,31 @@ def assert_unique_firm_year(df: pd.DataFrame, context: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def read_inputs() -> tuple[pd.DataFrame, pd.DataFrame]:
+def read_inputs() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if not MAIN_CSV.exists():
         raise FileNotFoundError(f"Missing main WRDS file: {MAIN_CSV}")
     if not AJEX_CSV.exists():
         raise FileNotFoundError(f"Missing adjustment-factor file: {AJEX_CSV}")
+    if not CCM_LINK_CSV.exists():
+        raise FileNotFoundError(f"Missing CCM link table: {CCM_LINK_CSV}")
+    if not CRSP_DSE_NAMES_CSV.exists():
+        raise FileNotFoundError(f"Missing CRSP name history file: {CRSP_DSE_NAMES_CSV}")
+    if not PAST_STOCK_RETURN_CSV.exists():
+        raise FileNotFoundError(f"Missing past stock return price file: {PAST_STOCK_RETURN_CSV}")
 
     main = pd.read_csv(MAIN_CSV, low_memory=False)
     ajex = pd.read_csv(AJEX_CSV, low_memory=False)
+    ccm_link = pd.read_csv(
+        CCM_LINK_CSV,
+        usecols=["gvkey", "LPERMNO", "LINKDT", "LINKENDDT", "LINKTYPE", "LINKPRIM"],
+        low_memory=False,
+    )
+    crsp_names = pd.read_csv(
+        CRSP_DSE_NAMES_CSV,
+        usecols=["DATE", "NAMEENDT", "PERMNO", "SHRCD", "EXCHCD"],
+        low_memory=False,
+    )
+    past_stock_prices = pd.read_csv(PAST_STOCK_RETURN_CSV, low_memory=False)
 
     required_main = {
         "costat",
@@ -233,21 +225,333 @@ def read_inputs() -> tuple[pd.DataFrame, pd.DataFrame]:
         "prcc_f",
     }
     required_ajex = {"gvkey", "datadate", "ajex"}
+    required_past_stock_prices = {
+        "costat",
+        "curcd",
+        "datafmt",
+        "indfmt",
+        "consol",
+        "gvkey",
+        "datadate",
+        "sic",
+        "sich",
+        "fyear",
+        "prcc_f",
+        "ajex",
+    }
     missing_main = sorted(required_main - set(main.columns))
     missing_ajex = sorted(required_ajex - set(ajex.columns))
+    missing_past_stock_prices = sorted(required_past_stock_prices - set(past_stock_prices.columns))
     if missing_main:
         raise ValueError(f"Main CSV is missing variables: {missing_main}")
     if missing_ajex:
         raise ValueError(f"ajex CSV is missing variables: {missing_ajex}")
+    if missing_past_stock_prices:
+        raise ValueError(f"Past stock return CSV is missing variables: {missing_past_stock_prices}")
 
     if main.duplicated(["gvkey", "datadate"]).any():
         raise ValueError("Main CSV has duplicated gvkey-datadate rows.")
     if ajex.duplicated(["gvkey", "datadate"]).any():
         raise ValueError("ajex CSV has duplicated gvkey-datadate rows.")
-    return main, ajex
+    return main, ajex, ccm_link, crsp_names, past_stock_prices
 
 
-def clean_and_construct(main: pd.DataFrame, ajex: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float]]:
+def parse_wrds_date(series: pd.Series, *, open_ended: bool = False) -> pd.Series:
+    values = series.astype("string").str.strip()
+    values = values.mask(values.eq(""))
+    if open_ended:
+        values = values.replace({"E": "2099-12-31"})
+    return pd.to_datetime(values, errors="coerce")
+
+
+def prepare_ccm_link_table(ccm_link: pd.DataFrame) -> pd.DataFrame:
+    ccm = ccm_link.rename(columns=str.lower).copy()
+    ccm["gvkey"] = safe_numeric(ccm["gvkey"])
+    ccm["lpermno"] = safe_numeric(ccm["lpermno"])
+    ccm["linkdt"] = parse_wrds_date(ccm["linkdt"])
+    ccm["linkenddt"] = parse_wrds_date(ccm["linkenddt"], open_ended=True).fillna(pd.Timestamp("2099-12-31"))
+    ccm["linktype"] = ccm["linktype"].astype("string").str.strip().str.upper()
+    ccm["linkprim"] = ccm["linkprim"].astype("string").str.strip().str.upper()
+    return ccm[
+        ccm["linktype"].isin(["LC", "LU", "LS"])
+        & ccm["linkprim"].isin(["P", "C"])
+        & ccm["gvkey"].notna()
+        & ccm["lpermno"].notna()
+        & ccm["linkdt"].notna()
+    ].copy()
+
+
+def prepare_crsp_name_history(crsp_names: pd.DataFrame) -> pd.DataFrame:
+    names = crsp_names.rename(columns=str.lower).rename(columns={"date": "namedt"}).copy()
+    names["permno"] = safe_numeric(names["permno"])
+    names["shrcd"] = safe_numeric(names["shrcd"])
+    names["exchcd"] = safe_numeric(names["exchcd"])
+    names["namedt"] = parse_wrds_date(names["namedt"])
+    names["nameendt"] = parse_wrds_date(names["nameendt"], open_ended=True).fillna(pd.Timestamp("2099-12-31"))
+    return names[
+        names["shrcd"].isin([10, 11])
+        & names["exchcd"].isin([1, 2, 3])
+        & names["permno"].notna()
+        & names["namedt"].notna()
+    ].copy()
+
+
+def apply_crsp_ccm_stock_screen(
+    df: pd.DataFrame,
+    ccm_link: pd.DataFrame,
+    crsp_names: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    ccm = prepare_ccm_link_table(ccm_link)
+    names = prepare_crsp_name_history(crsp_names)
+    work = df.copy()
+    work["datadate_dt"] = parse_wrds_date(work["datadate"])
+    valid_datadate = work["datadate_dt"].notna()
+
+    linked = work[valid_datadate].merge(ccm, on="gvkey", how="inner")
+    linked = linked[
+        linked["datadate_dt"].ge(linked["linkdt"])
+        & linked["datadate_dt"].le(linked["linkenddt"])
+    ].copy()
+
+    screened = linked.merge(names, left_on="lpermno", right_on="permno", how="inner")
+    screened = screened[
+        screened["datadate_dt"].ge(screened["namedt"])
+        & screened["datadate_dt"].le(screened["nameendt"])
+    ].copy()
+
+    helper_cols = [
+        "datadate_dt",
+        "lpermno",
+        "linkdt",
+        "linkenddt",
+        "linktype",
+        "linkprim",
+        "permno",
+        "namedt",
+        "nameendt",
+        "shrcd",
+        "exchcd",
+    ]
+    screened = screened.drop(columns=helper_cols, errors="ignore")
+    summary = {
+        "ccm_link_rows_used": len(ccm),
+        "crsp_name_rows_used": len(names),
+        "crsp_ccm_valid_datadate_rows": int(valid_datadate.sum()),
+        "crsp_ccm_linked_rows": len(linked),
+        "crsp_ccm_linked_firms": int(linked["gvkey"].nunique()),
+        "crsp_ccm_screened_rows": len(screened),
+        "crsp_ccm_screened_firms": int(screened["gvkey"].nunique()),
+    }
+    return screened, summary
+
+
+def nearest_adjusted_price_lag3(
+    df: pd.DataFrame,
+    tolerance_days: int = 183,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    work = df[["gvkey", "datadate", "adjusted_price"]].copy()
+    work["datadate_dt"] = parse_wrds_date(work["datadate"])
+    work["target_lag3_date"] = work["datadate_dt"] - pd.DateOffset(years=3)
+    lag_price = pd.Series(np.nan, index=df.index, dtype="float64")
+    matched = pd.Series(False, index=df.index)
+    distance_days = pd.Series(np.nan, index=df.index, dtype="float64")
+    history = work.dropna(subset=["gvkey", "datadate_dt", "adjusted_price"]).copy()
+    history_groups = {gvkey: group.sort_values("datadate_dt") for gvkey, group in history.groupby("gvkey")}
+
+    for gvkey, idx in work.groupby("gvkey").groups.items():
+        hist = history_groups.get(gvkey)
+        if hist is None or hist.empty:
+            continue
+
+        current = work.loc[idx]
+        dates = hist["datadate_dt"].to_numpy(dtype="datetime64[ns]")
+        prices = hist["adjusted_price"].to_numpy(dtype="float64")
+        targets = current["target_lag3_date"].to_numpy(dtype="datetime64[ns]")
+        positions = np.searchsorted(dates, targets)
+        best_positions = np.full(len(current), -1, dtype=int)
+        best_distances = np.full(len(current), np.inf)
+
+        for candidates in [positions - 1, positions]:
+            valid = (candidates >= 0) & (candidates < len(dates))
+            if not valid.any():
+                continue
+            candidate_distances = np.full(len(current), np.inf)
+            candidate_distances[valid] = np.abs(
+                (dates[candidates[valid]] - targets[valid]).astype("timedelta64[D]").astype(float)
+            )
+            take = candidate_distances < best_distances
+            best_distances[take] = candidate_distances[take]
+            best_positions[take] = candidates[take]
+
+        usable = (best_positions >= 0) & (best_distances <= tolerance_days)
+        lag_price.loc[current.index[usable]] = prices[best_positions[usable]]
+        matched.loc[current.index[usable]] = True
+        distance_days.loc[current.index[usable]] = best_distances[usable]
+
+    return lag_price, matched, distance_days
+
+
+def prepare_past_stock_return_price_history(
+    price_history: pd.DataFrame,
+    ccm_link: pd.DataFrame,
+    crsp_names: pd.DataFrame,
+    use_crsp_ccm_screen: bool = True,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    history = price_history.copy()
+    numeric_cols = ["gvkey", "fyear", "sic", "sich", "prcc_f", "ajex"]
+    for col in numeric_cols:
+        history[col] = safe_numeric(history[col])
+
+    raw_rows = len(history)
+    raw_firms = int(history["gvkey"].nunique())
+    format_mask = (
+        (history["consol"] == "C")
+        & (history["indfmt"] == "INDL")
+        & (history["datafmt"] == "STD")
+        & (history["curcd"] == "USD")
+    )
+    history = history[format_mask].copy()
+    format_rows = len(history)
+    format_firms = int(history["gvkey"].nunique())
+
+    history["sic_use"] = history["sich"].where(history["sich"].notna(), history["sic"])
+    industry_excluded = history["sic_use"].between(6000, 6999, inclusive="both") | history["sic_use"].between(
+        4900, 4999, inclusive="both"
+    )
+    history = history[~industry_excluded].copy()
+    industry_rows = len(history)
+    industry_firms = int(history["gvkey"].nunique())
+
+    if use_crsp_ccm_screen:
+        history, stock_summary = apply_crsp_ccm_stock_screen(history, ccm_link, crsp_names)
+        stock_summary = {f"past_return_price_{key}": value for key, value in stock_summary.items()}
+    else:
+        stock_summary = {
+            "past_return_price_crsp_ccm_linked_rows": len(history),
+            "past_return_price_crsp_ccm_linked_firms": int(history["gvkey"].nunique()),
+            "past_return_price_crsp_ccm_screened_rows": len(history),
+            "past_return_price_crsp_ccm_screened_firms": int(history["gvkey"].nunique()),
+        }
+
+    history["datadate_dt"] = parse_wrds_date(history["datadate"])
+    history["adjusted_price"] = np.where(
+        history["prcc_f"].notna() & history["prcc_f"].gt(0) & history["ajex"].notna() & history["ajex"].gt(0),
+        history["prcc_f"] / history["ajex"],
+        np.nan,
+    )
+    history = history[history["gvkey"].notna() & history["fyear"].notna() & history["datadate_dt"].notna()].copy()
+    history["has_external_adjusted_price"] = history["adjusted_price"].notna()
+    history = history.sort_values(["gvkey", "fyear", "has_external_adjusted_price", "datadate_dt"])
+    duplicate_gvkey_fyear_rows = int(history.duplicated(["gvkey", "fyear"]).sum())
+    history = history.drop_duplicates(["gvkey", "fyear"], keep="last").copy()
+
+    stats = {
+        "past_return_price_raw_rows": raw_rows,
+        "past_return_price_raw_firms": raw_firms,
+        "past_return_price_format_rows": format_rows,
+        "past_return_price_format_firms": format_firms,
+        "past_return_price_industry_rows": industry_rows,
+        "past_return_price_industry_firms": industry_firms,
+        "past_return_price_duplicate_gvkey_fyear_rows_removed": duplicate_gvkey_fyear_rows,
+        "past_return_price_final_rows": len(history),
+        "past_return_price_final_firms": int(history["gvkey"].nunique()),
+        "past_return_price_adjusted_price_nonmissing": int(history["adjusted_price"].notna().sum()),
+        **stock_summary,
+    }
+    keep_cols = ["gvkey", "fyear", "datadate", "datadate_dt", "adjusted_price"]
+    return history[keep_cols].copy(), stats
+
+
+def nearest_adjusted_price_lag3_from_history(
+    target: pd.DataFrame,
+    history: pd.DataFrame,
+    tolerance_days: int = 183,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    work = target[["gvkey", "datadate"]].copy()
+    work["datadate_dt"] = parse_wrds_date(work["datadate"])
+    work["target_lag3_date"] = work["datadate_dt"] - pd.DateOffset(years=3)
+    lag_price = pd.Series(np.nan, index=target.index, dtype="float64")
+    matched = pd.Series(False, index=target.index)
+    distance_days = pd.Series(np.nan, index=target.index, dtype="float64")
+    usable_history = history.dropna(subset=["gvkey", "datadate_dt", "adjusted_price"]).copy()
+    history_groups = {gvkey: group.sort_values("datadate_dt") for gvkey, group in usable_history.groupby("gvkey")}
+
+    for gvkey, idx in work.groupby("gvkey").groups.items():
+        hist = history_groups.get(gvkey)
+        if hist is None or hist.empty:
+            continue
+
+        current = work.loc[idx]
+        dates = hist["datadate_dt"].to_numpy(dtype="datetime64[ns]")
+        prices = hist["adjusted_price"].to_numpy(dtype="float64")
+        targets = current["target_lag3_date"].to_numpy(dtype="datetime64[ns]")
+        positions = np.searchsorted(dates, targets)
+        best_positions = np.full(len(current), -1, dtype=int)
+        best_distances = np.full(len(current), np.inf)
+
+        for candidates in [positions - 1, positions]:
+            valid = (candidates >= 0) & (candidates < len(dates))
+            if not valid.any():
+                continue
+            candidate_distances = np.full(len(current), np.inf)
+            candidate_distances[valid] = np.abs(
+                (dates[candidates[valid]] - targets[valid]).astype("timedelta64[D]").astype(float)
+            )
+            take = candidate_distances < best_distances
+            best_distances[take] = candidate_distances[take]
+            best_positions[take] = candidates[take]
+
+        usable = (best_positions >= 0) & (best_distances <= tolerance_days)
+        lag_price.loc[current.index[usable]] = prices[best_positions[usable]]
+        matched.loc[current.index[usable]] = True
+        distance_days.loc[current.index[usable]] = best_distances[usable]
+
+    return lag_price, matched, distance_days
+
+
+def apply_external_past_stock_return(df: pd.DataFrame, price_history: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    current_prices = price_history[["gvkey", "fyear", "adjusted_price"]].rename(
+        columns={"adjusted_price": "adjusted_price_external"}
+    )
+    out = out.merge(current_prices, on=["gvkey", "fyear"], how="left", validate="one_to_one")
+    out["adjusted_price"] = out["adjusted_price_external"]
+
+    price_lag = price_history[["gvkey", "fyear", "adjusted_price"]].copy()
+    price_lag["fyear"] = price_lag["fyear"] + 3
+    price_lag["has_adjusted_price_lag3_row"] = True
+    price_lag = price_lag.rename(columns={"adjusted_price": "adjusted_price_lag3"})
+    out = out.merge(price_lag, on=["gvkey", "fyear"], how="left", validate="one_to_one")
+    out["has_adjusted_price_lag3_row"] = out["has_adjusted_price_lag3_row"].eq(True)
+
+    lag3_date_price, lag3_date_matched, lag3_date_distance = nearest_adjusted_price_lag3_from_history(out, price_history)
+    need_date_lag = out["adjusted_price_lag3"].isna()
+    out["adjusted_price_lag3_date"] = lag3_date_price
+    out["has_adjusted_price_lag3_date_match"] = lag3_date_matched
+    out["adjusted_price_lag3_date_distance_days"] = lag3_date_distance
+    out.loc[need_date_lag, "adjusted_price_lag3"] = out.loc[need_date_lag, "adjusted_price_lag3_date"]
+    out["past_stock_return_source"] = pd.Series(pd.NA, index=out.index, dtype="object")
+    out.loc[out["has_adjusted_price_lag3_row"], "past_stock_return_source"] = "past_return_csv_exact_fyear_lag3"
+    out.loc[
+        need_date_lag & out["has_adjusted_price_lag3_date_match"],
+        "past_stock_return_source",
+    ] = "past_return_csv_nearest_datadate_lag3"
+    out["past_stock_return"] = np.where(
+        out["adjusted_price"].notna() & out["adjusted_price_lag3"].notna() & out["adjusted_price_lag3"].gt(0),
+        out["adjusted_price"] / out["adjusted_price_lag3"] - 1,
+        np.nan,
+    )
+    return out
+
+
+def clean_and_construct(
+    main: pd.DataFrame,
+    ajex: pd.DataFrame,
+    ccm_link: pd.DataFrame,
+    crsp_names: pd.DataFrame,
+    past_stock_prices: pd.DataFrame,
+    use_crsp_ccm_screen: bool = True,
+) -> tuple[pd.DataFrame, dict[str, float]]:
     df = main.merge(
         ajex[["gvkey", "datadate", "ajex"]],
         on=["gvkey", "datadate"],
@@ -317,9 +621,25 @@ def clean_and_construct(main: pd.DataFrame, ajex: pd.DataFrame) -> tuple[pd.Data
 
     df = df[~industry_excluded].copy()
     clean_rows_before_year = len(df)
+    clean_firms_before_year = int(df["gvkey"].nunique())
+
+    if use_crsp_ccm_screen:
+        df, stock_screen_summary = apply_crsp_ccm_stock_screen(df, ccm_link, crsp_names)
+        sample_context = "CRSP/CCM-screened clean Compustat sample"
+    else:
+        stock_screen_summary = {
+            "ccm_link_rows_used": 0,
+            "crsp_name_rows_used": 0,
+            "crsp_ccm_valid_datadate_rows": len(df),
+            "crsp_ccm_linked_rows": len(df),
+            "crsp_ccm_linked_firms": int(df["gvkey"].nunique()),
+            "crsp_ccm_screened_rows": len(df),
+            "crsp_ccm_screened_firms": int(df["gvkey"].nunique()),
+        }
+        sample_context = "Compustat sample without CRSP/CCM stock screen"
 
     df = df.sort_values(["gvkey", "fyear", "datadate"]).reset_index(drop=True)
-    assert_unique_firm_year(df, "Clean Compustat sample")
+    assert_unique_firm_year(df, sample_context)
 
     df["dividend"] = df["dvc"]
     df["dividend_dummy"] = np.select(
@@ -328,7 +648,12 @@ def clean_and_construct(main: pd.DataFrame, ajex: pd.DataFrame) -> tuple[pd.Data
         default=np.nan,
     )
     df["special_items"] = df["spi"].fillna(0)
-    df["earnings"] = df["ib"] - 0.6 * df["special_items"]
+    df["earnings"] = df["ib"]
+    df["adjusted_earnings"] = np.where(
+        df["ib"].notna(),
+        df["ib"] - 0.6 * df["special_items"],
+        np.nan,
+    )
 
     lag_tstkc = df[["gvkey", "fyear", "tstkc"]].copy()
     lag_tstkc["fyear"] = lag_tstkc["fyear"] + 1
@@ -342,7 +667,7 @@ def clean_and_construct(main: pd.DataFrame, ajex: pd.DataFrame) -> tuple[pd.Data
     treasury_method = tstkc_pair_observed & ~retirement_method
     cashflow_complete = df["prstkc"].notna() & df["sstk"].notna()
     retirement_complete = retirement_method & cashflow_complete
-    cashflow_fallback = ~tstkc_pair_observed & cashflow_complete
+    missing_tstkc_pair_cashflow_complete = ~tstkc_pair_observed & cashflow_complete
 
     df["repurchase"] = np.nan
     df["repurchase_source"] = pd.Series(pd.NA, index=df.index, dtype="object")
@@ -352,11 +677,8 @@ def clean_and_construct(main: pd.DataFrame, ajex: pd.DataFrame) -> tuple[pd.Data
         df.loc[retirement_complete, "prstkc"] - df.loc[retirement_complete, "sstk"]
     )
     df.loc[retirement_complete, "repurchase_source"] = "retirement_method"
-    df.loc[cashflow_fallback, "repurchase"] = (
-        df.loc[cashflow_fallback, "prstkc"] - df.loc[cashflow_fallback, "sstk"]
-    )
-    df.loc[cashflow_fallback, "repurchase_source"] = "cashflow_fallback"
     df.loc[retirement_method & ~cashflow_complete, "repurchase_source"] = "missing_cashflow_inputs"
+    df.loc[missing_tstkc_pair_cashflow_complete, "repurchase_source"] = "missing_tstkc_pair_cashflow_available_not_used"
     df.loc[~tstkc_pair_observed & ~cashflow_complete, "repurchase_source"] = "missing_tstkc_pair_and_cashflow_inputs"
     df["repurchase"] = df["repurchase"].replace([np.inf, -np.inf], np.nan).clip(lower=0)
     df["repurchase_dummy"] = np.select(
@@ -384,22 +706,13 @@ def clean_and_construct(main: pd.DataFrame, ajex: pd.DataFrame) -> tuple[pd.Data
         df["che"] / df["at"],
         np.nan,
     )
-    df["adjusted_price"] = np.where(
-        df["prcc_f"].notna() & df["prcc_f"].gt(0) & df["ajex"].notna() & df["ajex"].gt(0),
-        df["prcc_f"] / df["ajex"],
-        np.nan,
+    past_return_price_history, past_return_price_summary = prepare_past_stock_return_price_history(
+        past_stock_prices,
+        ccm_link,
+        crsp_names,
+        use_crsp_ccm_screen=use_crsp_ccm_screen,
     )
-    price_lag = df[["gvkey", "fyear", "adjusted_price"]].copy()
-    price_lag["fyear"] = price_lag["fyear"] + 3
-    price_lag["has_adjusted_price_lag3_row"] = True
-    price_lag = price_lag.rename(columns={"adjusted_price": "adjusted_price_lag3"})
-    df = df.merge(price_lag, on=["gvkey", "fyear"], how="left", validate="one_to_one")
-    df["has_adjusted_price_lag3_row"] = df["has_adjusted_price_lag3_row"].eq(True)
-    df["past_stock_return"] = np.where(
-        df["adjusted_price"].notna() & df["adjusted_price_lag3"].notna() & df["adjusted_price_lag3"].gt(0),
-        df["adjusted_price"] / df["adjusted_price_lag3"] - 1,
-        np.nan,
-    )
+    df = apply_external_past_stock_return(df, past_return_price_history)
     df["eso_dilution"] = np.where(
         df["fyear"].ge(1995)
         & df["xintopt"].notna()
@@ -427,8 +740,10 @@ def clean_and_construct(main: pd.DataFrame, ajex: pd.DataFrame) -> tuple[pd.Data
         "sic_sich_missing_rows": sic_sich_missing_rows,
         "sic_sich_missing_firms": sic_sich_missing_firms,
         "clean_rows_before_year": clean_rows_before_year,
-        "clean_firms_before_year": int(df["gvkey"].nunique()),
+        "clean_firms_before_year": clean_firms_before_year,
         "firm_year_duplicate_rows_after_clean": 0,
+        **stock_screen_summary,
+        **past_return_price_summary,
     }
     return df, summary
 
@@ -481,7 +796,7 @@ def firm_period_counts(df: pd.DataFrame, start: int, end: int) -> pd.DataFrame:
     )
     firm["div_missing_years"] = firm["firm_years"] - firm["div_valid_years"]
     firm["rep_missing_years"] = firm["firm_years"] - firm["rep_valid_years"]
-    firm["main_sample_entry"] = firm["firm_years"].ge(1)
+    firm["main_sample_entry"] = firm["div_valid_years"].ge(1) & firm["rep_valid_years"].ge(1)
     firm["div_status_complete"] = firm["div_valid_years"].eq(firm["firm_years"])
     firm["rep_status_complete"] = firm["rep_valid_years"].eq(firm["firm_years"])
     firm["payout_status_complete"] = firm["div_status_complete"] & firm["rep_status_complete"]
@@ -543,27 +858,30 @@ def build_figure1(df: pd.DataFrame) -> pd.DataFrame:
 
 def plot_figure1(annual: pd.DataFrame) -> plt.Figure:
     fig, ax = plt.subplots(figsize=PAGE)
-    ax.plot(annual["fyear"], annual["earnings"], color=COLOR_EARNINGS, lw=2.2, label="调整后收益")
+    ax.plot(annual["fyear"], annual["earnings"], color=COLOR_EARNINGS, lw=2.2, label="Compustat earnings")
     ax.plot(
         annual["fyear"],
         annual["special_items"],
         color=COLOR_SPECIAL,
         lw=1.8,
         ls=(0, (5, 2, 1, 2)),
-        label="特殊项目",
+        label="Special items",
     )
-    ax.plot(annual["fyear"], annual["dividends"], color=COLOR_DIVIDENDS, lw=1.9, ls="--", label="股利")
+    ax.plot(annual["fyear"], annual["dividends"], color=COLOR_DIVIDENDS, lw=1.9, ls="--", label="Dividends")
     ax.plot(
         annual["fyear"],
         annual["net_repurchases"],
         color=COLOR_REPURCHASES,
         lw=1.9,
         ls=(0, (8, 3)),
-        label="净回购",
+        label="Net repurchases",
     )
-    ax.axhline(0, color="black", lw=0.8)
-    ax.set_title("Figure 1  Compustat收益、特殊项目、股利和净回购总额，1970-2005")
-    ax.set_xlabel("财政年度")
+    place_xaxis_at_zero(ax)
+    ax.set_xlim(1970, 2005)
+    ax.set_ylim(-400000, 600000)
+    ax.margins(x=0)
+    ax.set_title("Figure 1  Aggregate Compustat earnings, special items, dividends, and net repurchases, 1970-2005")
+    ax.set_xlabel("Fiscal year")
     ax.set_ylabel("$ millions")
     ax.yaxis.set_major_formatter(FuncFormatter(fmt_millions_axis))
     ax.grid(axis="y", color=GRID_COLOR, lw=0.6)
@@ -571,7 +889,7 @@ def plot_figure1(annual: pd.DataFrame) -> plt.Figure:
     fig.text(
         0.09,
         0.03,
-        "注：金额单位为Compustat百万美元。样本剔除非美国注册公司、金融公司和公用事业公司。",
+        "Notes: Amounts are in Compustat $ millions. The earnings line uses Compustat ib.",
         fontsize=8.5,
     )
     fig.tight_layout(rect=(0, 0.06, 1, 0.98))
@@ -710,69 +1028,75 @@ def build_sample_audit_table(summary: dict[str, float], df: pd.DataFrame) -> pd.
     sample_1980 = df[(df["fyear"] >= 1980) & (df["fyear"] <= 2005)]
     rows = [
         (
-            "原始合并数据",
+            "Merged raw data",
             summary["raw_rows"],
             summary["raw_firms"],
-            "2.csv与ajex.csv按gvkey和datadate合并后的观测。",
+            "Observations after merging 2.csv and ajex.csv by gvkey and datadate.",
         ),
         (
-            "WRDS格式筛选后",
+            "After WRDS format screen",
             summary["wrds_rows"],
             summary["wrds_firms"],
-            "保留consol=C、indfmt=INDL、datafmt=STD、curcd=USD。",
+            "Keep consol=C, indfmt=INDL, datafmt=STD, and curcd=USD.",
         ),
         (
-            "美国注册公司",
+            "US-incorporated firms",
             summary["usa_rows"],
             summary["usa_firms"],
-            "保留fic=USA。",
+            "Keep fic=USA.",
         ),
         (
-            "行业筛选后",
+            "After industry screen",
             summary["clean_rows_before_year"],
             summary["clean_firms_before_year"],
-            "先构造sic_use：sich非缺失时使用历史行业代码，sich缺失时用sic补充；仅按sic_use剔除金融6000-6999和公用事业4900-4999。",
+            "Use sich first and sic as fallback for sic_use; exclude financial SIC 6000-6999 and utility SIC 4900-4999.",
         ),
         (
-            "sic_use来自sich",
+            "After CRSP/CCM stock screen",
+            summary["crsp_ccm_screened_rows"],
+            summary["crsp_ccm_screened_firms"],
+            "Keep valid CCM LC/LU/LS links with LINKPRIM P/C and CRSP common shares SHRCD 10/11 on NYSE/AMEX/NASDAQ EXCHCD 1/2/3.",
+        ),
+        (
+            "sic_use from sich",
             summary["sic_use_from_sich_rows"],
             np.nan,
-            "行业筛选诊断项；表示使用历史行业代码sich判断行业的公司年数。",
+            "Diagnostic count of firm-years whose industry screen uses historical SIC sich.",
         ),
         (
-            "sic_use来自sic",
+            "sic_use from sic",
             summary["sic_use_from_sic_rows"],
             np.nan,
-            "行业筛选诊断项；表示sich缺失时使用sic补充判断行业的公司年数。",
+            "Diagnostic count of firm-years whose industry screen uses sic fallback.",
         ),
         (
-            "按sic_use剔除金融/公用事业",
+            "Excluded by sic_use screen",
             summary["industry_excluded_rows"],
             summary["industry_excluded_firms"],
-            f"金融公司年{summary['industry_excluded_financial_rows']:,.0f}；公用事业公司年{summary['industry_excluded_utility_rows']:,.0f}。",
+            f"Financial firm-years: {summary['industry_excluded_financial_rows']:,.0f}; utility firm-years: {summary['industry_excluded_utility_rows']:,.0f}.",
         ),
         (
-            "sic和sich均缺失",
+            "Both sic and sich missing",
             summary["sic_sich_missing_rows"],
             summary["sic_sich_missing_firms"],
-            "诊断项；两个行业字段均缺失的公司保留，但报告中单独披露。",
+            "Diagnostic count; observations are retained but separately reported.",
         ),
         (
-            "1970-2005样本",
+            "1970-2005 sample",
             len(sample_1970),
             sample_1970["gvkey"].nunique(),
-            "用于Figure 1。",
+            "Used for Figure 1.",
         ),
         (
-            "1980-2005样本",
+            "1980-2005 sample",
             len(sample_1980),
             sample_1980["gvkey"].nunique(),
-            "用于Table 2、Figure 2、Figure 3与Table 3分组。",
+            "Used for Table 2, Figure 2, Figure 3, and Table 3 grouping.",
         ),
     ]
-    out = pd.DataFrame(rows, columns=["阶段", "公司年", "公司数", "说明"]).set_index("阶段")
-    out["公司年"] = out["公司年"].map(fmt_int)
-    out["公司数"] = out["公司数"].map(fmt_int)
+    out = pd.DataFrame(rows, columns=["stage", "firm_years", "firms", "note"]).set_index("stage")
+    out["firm_years"] = out["firm_years"].map(fmt_int)
+    out["firms"] = out["firms"].map(fmt_int)
     out.to_csv(TABLE_DIR / "sample_audit.csv")
     return out
 
@@ -787,28 +1111,28 @@ def build_group_diagnostics(df: pd.DataFrame, firm_groups: pd.DataFrame) -> pd.D
         published_firms = PUBLISHED_GROUP_COUNTS[gid]
         rows.append(
             {
-                "组别": GROUP_NAMES_CN[gid],
-                "原文公司数": published_firms,
-                "当前公司数": current_firms,
-                "差异": current_firms - published_firms,
-                "公司年": len(g),
-                "收益合计": sum_observed(g["earnings"]),
-                "股利合计": sum_observed(g["dividend"]),
-                "净回购合计": sum_observed(g["repurchase"]),
-                "亏损比例": g["loss"].mean(),
-                "ROA中位数": g["roa"].median(),
-                "现金/资产中位数": g["cash"].median(),
-                "三年收益中位数": g["past_stock_return"].median(),
-                "ESO覆盖率": g_1995["eso_dilution"].notna().mean(),
+                "group": GROUP_NAMES_CN[gid],
+                "published_firms": published_firms,
+                "current_firms": current_firms,
+                "difference": current_firms - published_firms,
+                "firm_years": len(g),
+                "earnings_sum": sum_observed(g["earnings"]),
+                "dividend_sum": sum_observed(g["dividend"]),
+                "repurchase_sum": sum_observed(g["repurchase"]),
+                "loss_rate": g["loss"].mean(),
+                "roa_median": g["roa"].median(),
+                "cash_median": g["cash"].median(),
+                "past_stock_return_median": g["past_stock_return"].median(),
+                "eso_coverage": g_1995["eso_dilution"].notna().mean(),
             }
         )
-    out = pd.DataFrame(rows).set_index("组别")
+    out = pd.DataFrame(rows).set_index("group")
     display = out.copy()
-    for col in ["原文公司数", "当前公司数", "差异", "公司年", "收益合计", "股利合计", "净回购合计"]:
+    for col in ["published_firms", "current_firms", "difference", "firm_years", "earnings_sum", "dividend_sum", "repurchase_sum"]:
         display[col] = display[col].map(fmt_int)
-    for col in ["亏损比例", "ESO覆盖率"]:
+    for col in ["loss_rate", "eso_coverage"]:
         display[col] = display[col].map(fmt_pct)
-    for col in ["ROA中位数", "现金/资产中位数", "三年收益中位数"]:
+    for col in ["roa_median", "cash_median", "past_stock_return_median"]:
         display[col] = display[col].map(lambda x: "" if pd.isna(x) else f"{x:.3f}")
     out.to_csv(TABLE_DIR / "group_diagnostics_raw.csv")
     display.to_csv(TABLE_DIR / "group_diagnostics_display.csv")
@@ -816,11 +1140,18 @@ def build_group_diagnostics(df: pd.DataFrame, firm_groups: pd.DataFrame) -> pd.D
 
 
 def build_figure2(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    panel_a, panel_b = figure2_source_data(df)
+    panel_a.to_csv(TABLE_DIR / "figure2_panel_a_earnings.csv", index=False)
+    panel_b.to_csv(TABLE_DIR / "figure2_panel_b_earnings.csv", index=False)
+    return panel_a, panel_b
+
+
+def figure2_source_data(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     sample = df[(df["fyear"] >= 1980) & (df["fyear"] <= 2005)].copy()
-    all_earnings = sample.groupby("fyear")["earnings"].apply(sum_observed).rename("All industrials").reset_index()
+    all_earnings = sample.groupby("fyear")["adjusted_earnings"].apply(sum_observed).rename("All industrials").reset_index()
     group2 = (
         sample[sample["group_id"] == 2]
-        .groupby("fyear")["earnings"]
+        .groupby("fyear")["adjusted_earnings"]
         .apply(sum_observed)
         .rename("Regular div. + regular rep.")
         .reset_index()
@@ -831,19 +1162,18 @@ def build_figure2(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     wanted = [1, 3, 4, 5]
     panel_b = (
         sample[sample["group_id"].isin(wanted)]
-        .groupby(["fyear", "group_name"])["earnings"]
+        .groupby(["fyear", "group_name"])["adjusted_earnings"]
         .apply(sum_observed)
         .reset_index()
+        .rename(columns={"adjusted_earnings": "earnings"})
     )
-    panel_a.to_csv(TABLE_DIR / "figure2_panel_a_earnings.csv", index=False)
-    panel_b.to_csv(TABLE_DIR / "figure2_panel_b_earnings.csv", index=False)
     return panel_a, panel_b
 
 
 def plot_figure2(panel_a: pd.DataFrame, panel_b: pd.DataFrame) -> plt.Figure:
-    fig, axes = plt.subplots(1, 2, figsize=PAGE, gridspec_kw={"width_ratios": [1.05, 1.0]})
+    fig, axes = plt.subplots(2, 1, figsize=PAGE, gridspec_kw={"height_ratios": [1.0, 1.0]})
     ax = axes[0]
-    ax.plot(panel_a["fyear"], panel_a["All industrials"], color=COLOR_EARNINGS, lw=2.2, ls="--", label="全部工业公司")
+    ax.plot(panel_a["fyear"], panel_a["All industrials"], color=COLOR_EARNINGS, lw=2.2, ls="--", label="All industrials")
     ax.plot(
         panel_a["fyear"],
         panel_a["Regular div. + regular rep."],
@@ -851,9 +1181,12 @@ def plot_figure2(panel_a: pd.DataFrame, panel_b: pd.DataFrame) -> plt.Figure:
         lw=2.0,
         label="Group II",
     )
-    ax.axhline(0, color="black", lw=0.8)
-    ax.set_title("Panel A: 全部公司与Group II")
-    ax.set_xlabel("财政年度")
+    place_xaxis_at_zero(ax)
+    ax.set_xlim(1980, 2005)
+    ax.set_ylim(0, 600000)
+    ax.margins(x=0)
+    ax.set_title("Panel A: All industrials and Group II")
+    ax.set_xlabel("Fiscal year")
     ax.set_ylabel("$ millions")
     ax.yaxis.set_major_formatter(FuncFormatter(fmt_millions_axis))
     ax.grid(axis="y", color=GRID_COLOR, lw=0.6)
@@ -885,30 +1218,33 @@ def plot_figure2(panel_a: pd.DataFrame, panel_b: pd.DataFrame) -> plt.Figure:
         ax.text(
             0.5,
             0.52,
-            "当前分组口径下无可绘制的Group I、III、IV、V观测",
+            "No plottable Group I, III, IV, or V observations under the current classification.",
             transform=ax.transAxes,
             ha="center",
             va="center",
             fontsize=9,
             color="#555555",
         )
-    ax.axhline(0, color="black", lw=0.8)
-    ax.set_title("Panel B: 其他长期支付组")
-    ax.set_xlabel("财政年度")
+    place_xaxis_at_zero(ax)
+    ax.set_xlim(1980, 2005)
+    ax.set_ylim(-80000, 40000)
+    ax.margins(x=0)
+    ax.set_title("Panel B: Other long-run payout groups")
+    ax.set_xlabel("Fiscal year")
     ax.set_ylabel("$ millions")
     ax.yaxis.set_major_formatter(FuncFormatter(fmt_millions_axis))
     ax.grid(axis="y", color=GRID_COLOR, lw=0.6)
     if plotted:
         ax.legend(frameon=False, loc="best", fontsize=8)
 
-    fig.suptitle("Figure 2  按长期支付组划分的总收益，1980-2005", y=0.98, fontsize=13)
+    fig.suptitle("Figure 2  Earnings by long-run payout group, 1980-2005", y=0.98, fontsize=13)
     fig.text(
         0.07,
         0.03,
-        "注：分组依据1980-2005年的长期支付行为。收益定义为 ib - 0.6 x spi。",
+        "Notes: Figure 2 uses the CRSP/CCM-screened Compustat sample. Earnings are ib - 0.6 x spi, with missing spi set to zero.",
         fontsize=8.5,
     )
-    fig.tight_layout(rect=(0, 0.06, 1, 0.94))
+    fig.tight_layout(rect=(0, 0.06, 1, 0.94), h_pad=2.0)
     return fig
 
 
@@ -960,17 +1296,19 @@ def plot_figure3(loss: pd.DataFrame) -> plt.Figure:
         ax.text(
             0.5,
             0.52,
-            "当前分组口径下无可绘制的Group I-V亏损比例",
+            "No plottable Group I-V loss-fraction observations under the current classification.",
             transform=ax.transAxes,
             ha="center",
             va="center",
             fontsize=10,
             color="#555555",
         )
+    ax.set_xlim(1980, 2005)
     ax.set_ylim(0, 0.9)
-    ax.set_title("Figure 3  各长期支付组报告亏损的公司比例，1980-2005")
-    ax.set_xlabel("财政年度")
-    ax.set_ylabel("调整后收益小于0的公司比例")
+    ax.margins(x=0)
+    ax.set_title("Figure 3  Fraction of firms reporting losses by long-run payout group, 1980-2005")
+    ax.set_xlabel("Fiscal year")
+    ax.set_ylabel("Fraction of firms with negative Compustat earnings")
     ax.yaxis.set_major_formatter(FuncFormatter(lambda x, _pos: f"{x * 100:.0f}%"))
     ax.grid(axis="y", color=GRID_COLOR, lw=0.6)
     if plotted:
@@ -978,7 +1316,7 @@ def plot_figure3(loss: pd.DataFrame) -> plt.Figure:
     fig.text(
         0.08,
         0.03,
-        "注：亏损基于调整后收益。分组依据1980-2005年的长期支付行为。",
+        "Notes: Losses are based on Compustat earnings. Groups are based on long-run payout behavior over 1980-2005.",
         fontsize=8.5,
     )
     fig.tight_layout(rect=(0, 0.06, 1, 0.98))
@@ -986,7 +1324,7 @@ def plot_figure3(loss: pd.DataFrame) -> plt.Figure:
 
 
 # ---------------------------------------------------------------------------
-# Table 3: Stata artifacts and Python-equivalent fallback
+# Table 3: Stata input artifacts
 # ---------------------------------------------------------------------------
 
 
@@ -1116,225 +1454,8 @@ log close
 """.strip()
 
 
-def write_and_maybe_run_stata() -> bool:
-    do_path = STATA_DIR / "table3_replication.do"
-    do_path.write_text(stata_do_code(), encoding="utf-8")
-
-    if not RUN_STATA_IF_AVAILABLE:
-        return False
-
-    exe_candidate = find_stata_executable()
-    if not exe_candidate:
-        print("Stata executable not found on PATH. Set STATA_EXE if needed.")
-        return False
-
-    exe = Path(exe_candidate)
-    if not exe.exists() and shutil.which(exe_candidate) is None:
-        print(f"Stata executable not found: {exe_candidate}")
-        return False
-
-    try:
-        run_dir = Path(tempfile.mkdtemp(prefix="skinner_2008_stata_run_"))
-        temp_dta = run_dir / "table3_regression_data.dta"
-        temp_do = run_dir / "table3_replication.do"
-        temp_csv = run_dir / "table3_stata_results.csv"
-        temp_log = run_dir / "table3_stata.log"
-        temp_results = run_dir / "table3_stata_results.dta"
-
-        shutil.copy2(STATA_DIR / "table3_regression_data.dta", temp_dta)
-        temp_do.write_text(stata_do_code(run_dir), encoding="utf-8")
-
-        command = [str(exe), "/b", "do", str(temp_do)] if exe.exists() else [exe_candidate, "/b", "do", str(temp_do)]
-        proc = subprocess.Popen(command, cwd=str(run_dir))
-        deadline = time.time() + 300
-        while time.time() < deadline:
-            if temp_csv.exists():
-                break
-            if proc.poll() is not None:
-                break
-            time.sleep(1)
-
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-
-        if proc.returncode not in (0, None) and not temp_csv.exists():
-            raise RuntimeError(f"Stata exited with code {proc.returncode}")
-        if not temp_csv.exists():
-            raise TimeoutError("Stata did not create table3_stata_results.csv within 300 seconds.")
-
-        if temp_csv.exists():
-            shutil.copy2(temp_csv, STATA_DIR / "table3_stata_results.csv")
-        if temp_log.exists():
-            shutil.copy2(temp_log, STATA_DIR / "table3_stata.log")
-        if temp_results.exists():
-            shutil.copy2(temp_results, STATA_DIR / "table3_stata_results.dta")
-        return (STATA_DIR / "table3_stata_results.csv").exists()
-    except Exception as exc:
-        print(f"Warning: Stata could not be run automatically: {exc}")
-        return False
-
-
-def windows_registry_path_entries() -> list[str]:
-    if os.name != "nt":
-        return []
-    try:
-        import winreg
-    except Exception:
-        return []
-
-    locations = [
-        (winreg.HKEY_CURRENT_USER, r"Environment", "Path"),
-        (
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
-            "Path",
-        ),
-    ]
-    entries: list[str] = []
-    for hive, key_path, value_name in locations:
-        try:
-            with winreg.OpenKey(hive, key_path) as key:
-                value, _kind = winreg.QueryValueEx(key, value_name)
-        except Exception:
-            continue
-        expanded = os.path.expandvars(str(value))
-        entries.extend([part for part in expanded.split(os.pathsep) if part.strip()])
-    return entries
-
-
-def find_stata_executable() -> str:
-    if STATA_EXE.strip():
-        return STATA_EXE.strip()
-
-    command_names = ["stata", "StataMP-64", "StataSE-64", "StataBE-64", "StataIC-64"]
-    for command in command_names:
-        found = shutil.which(command)
-        if found:
-            return found
-
-    env_paths = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p.strip()]
-    search_dirs = env_paths + windows_registry_path_entries()
-    executable_names = [
-        "stata.exe",
-        "StataMP-64.exe",
-        "StataSE-64.exe",
-        "StataBE-64.exe",
-        "StataIC-64.exe",
-        "StataMP.exe",
-        "StataSE.exe",
-        "StataBE.exe",
-        "StataIC.exe",
-    ]
-    for directory in search_dirs:
-        path_dir = Path(directory)
-        for name in executable_names:
-            candidate = path_dir / name
-            if candidate.exists():
-                return str(candidate)
-
-    common_roots = [
-        Path(os.environ.get("ProgramFiles", r"C:\Program Files")),
-        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")),
-        Path(r"C:\Stata18"),
-        Path(r"C:\Stata17"),
-        Path(r"C:\Stata16"),
-    ]
-    for root in common_roots:
-        if not root.exists():
-            continue
-        candidate_dirs = [root]
-        if root.name == "Program Files" or root.name == "Program Files (x86)":
-            for version in range(20, 12, -1):
-                candidate_dirs.append(root / f"Stata{version}")
-        for directory in candidate_dirs:
-            for name in executable_names:
-                candidate = directory / name
-                if candidate.exists():
-                    return str(candidate)
-    return ""
-
-
 def prepare_logit_sample(data: pd.DataFrame, required_cols: list[str]) -> pd.DataFrame:
     return data[required_cols].replace([np.inf, -np.inf], np.nan).dropna().copy()
-
-
-def run_logit_model(data: pd.DataFrame, y: str, xvars: list[str]) -> dict[str, object]:
-    cols = [y] + xvars
-    sub = prepare_logit_sample(data, cols)
-    sub = sub[sub[y].isin([0, 1])]
-    if sub[y].nunique() < 2:
-        raise ValueError("Logit dependent variable has only one class.")
-    x = sm.add_constant(sub[xvars], has_constant="add")
-    model = sm.Logit(sub[y], x)
-    result = model.fit(disp=0, maxiter=200)
-    return {
-        "result": result,
-        "n": int(result.nobs),
-        "y1": int(sub[y].sum()),
-        "y0": int(len(sub) - sub[y].sum()),
-        "pseudo_r2": float(result.prsquared),
-        "terms": ["const"] + xvars,
-    }
-
-
-def collect_model_rows(
-    model_info: dict[str, object], panel: str, model_label: str, display_terms: list[tuple[str, str]]
-) -> list[dict[str, object]]:
-    result = model_info["result"]
-    rows = []
-    for term, label in display_terms:
-        if term in result.params.index:
-            coef = float(result.params.loc[term])
-            se = float(result.bse.loc[term])
-            pval = float(result.pvalues.loc[term])
-        else:
-            coef = se = pval = np.nan
-        rows.append(
-            {
-                "panel": panel,
-                "model": model_label,
-                "term": term,
-                "label": label,
-                "coef": coef,
-                "se": se,
-                "p": pval,
-                "pseudo_r2": model_info["pseudo_r2"],
-                "N": model_info["n"],
-                "y1": model_info["y1"],
-                "y0": model_info["y0"],
-            }
-        )
-    return rows
-
-
-def empty_model_rows(
-    panel: str,
-    model_label: str,
-    display_terms: list[tuple[str, str]],
-    nobs: int,
-    y1: int = 0,
-    y0: int = 0,
-) -> list[dict[str, object]]:
-    return [
-        {
-            "panel": panel,
-            "model": model_label,
-            "term": term,
-            "label": label,
-            "coef": np.nan,
-            "se": np.nan,
-            "p": np.nan,
-            "pseudo_r2": np.nan,
-            "N": nobs,
-            "y1": y1,
-            "y0": y0,
-        }
-        for term, label in display_terms
-    ]
 
 
 def table3_terms() -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
@@ -1394,32 +1515,6 @@ def table3_model_specs(reg: pd.DataFrame) -> list[tuple[str, str, pd.DataFrame, 
     return specs
 
 
-def python_table3_results(reg: pd.DataFrame) -> pd.DataFrame:
-    rows: list[dict[str, object]] = []
-
-    for panel, model_label, data, xvars, display_terms in table3_model_specs(reg):
-        complete = prepare_logit_sample(data, ["repurchase_dummy"] + xvars)
-        complete = complete[complete["repurchase_dummy"].isin([0, 1])]
-        if len(complete) == 0 or complete["repurchase_dummy"].nunique() < 2:
-            rows.extend(
-                empty_model_rows(
-                    panel,
-                    model_label,
-                    display_terms,
-                    len(complete),
-                    int(complete["repurchase_dummy"].sum()) if len(complete) else 0,
-                    int(len(complete) - complete["repurchase_dummy"].sum()) if len(complete) else 0,
-                )
-            )
-            continue
-        info = run_logit_model(data, "repurchase_dummy", xvars)
-        rows.extend(collect_model_rows(info, panel, model_label, display_terms))
-
-    results = pd.DataFrame(rows)
-    results.to_csv(TABLE_DIR / "table3_python_logit_results.csv", index=False)
-    return results
-
-
 def table3_all_models_estimable(reg: pd.DataFrame) -> bool:
     for _panel, _model_label, data, xvars, _display_terms in table3_model_specs(reg):
         complete = prepare_logit_sample(data, ["repurchase_dummy"] + xvars)
@@ -1427,32 +1522,6 @@ def table3_all_models_estimable(reg: pd.DataFrame) -> bool:
         if len(complete) == 0 or complete["repurchase_dummy"].nunique() < 2:
             return False
     return True
-
-
-def stata_table3_results() -> pd.DataFrame:
-    path = STATA_DIR / "table3_stata_results.csv"
-    if not path.exists():
-        raise FileNotFoundError(f"Missing Stata results file: {path}")
-
-    results = pd.read_csv(path)
-    term_map = {"_cons": "const"}
-    label_map = {
-        "const": "Intercept",
-        "regular_dummy": "Regular dummy",
-        "roa": "ROA",
-        "roa_regular": "ROA x Regular",
-        "past_stock_return": "Past stock return",
-        "cash": "Cash",
-        "eso_dilution": "ESO dilution",
-    }
-    results["term"] = results["term"].replace(term_map)
-    results["label"] = results["term"].map(label_map).fillna(results["term"])
-    for col in ["y1", "y0"]:
-        if col not in results.columns:
-            results[col] = np.nan
-    results = results[["panel", "model", "term", "label", "coef", "se", "p", "pseudo_r2", "N", "y1", "y0"]]
-    results.to_csv(TABLE_DIR / "table3_stata_logit_results.csv", index=False)
-    return results
 
 
 def table3_python_sample_audit(reg: pd.DataFrame) -> pd.DataFrame:
@@ -1470,43 +1539,6 @@ def table3_python_sample_audit(reg: pd.DataFrame) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
-
-
-def validate_stata_sample_counts(reg: pd.DataFrame, stata_results: pd.DataFrame) -> None:
-    python_audit = table3_python_sample_audit(reg)
-    stata_audit = (
-        stata_results.groupby(["panel", "model"], as_index=False)
-        .agg(stata_N=("N", "first"), stata_y1=("y1", "first"), stata_y0=("y0", "first"))
-    )
-    merged = python_audit.merge(stata_audit, on=["panel", "model"], how="outer")
-    for col in ["python_N", "python_y1", "python_y0", "stata_N", "stata_y1", "stata_y0"]:
-        merged[col] = pd.to_numeric(merged[col], errors="coerce")
-    merged["N_match"] = merged["python_N"].eq(merged["stata_N"])
-    merged["y1_match"] = merged["python_y1"].eq(merged["stata_y1"])
-    merged["y0_match"] = merged["python_y0"].eq(merged["stata_y0"])
-    merged.to_csv(TABLE_DIR / "qa_table3_python_stata_sample_check.csv", index=False)
-    bad = merged[~(merged["N_match"] & merged["y1_match"] & merged["y0_match"])]
-    if not bad.empty:
-        raise ValueError(
-            "Python and Stata Table 3 samples differ. See "
-            f"{TABLE_DIR / 'qa_table3_python_stata_sample_check.csv'}"
-        )
-
-
-def make_table3_display(results: pd.DataFrame, panel: str) -> pd.DataFrame:
-    panel_data = results[results["panel"] == panel].copy()
-    model_order = ["1980-1994", "1995-2005", "1995-2005 ESO"]
-    term_order = list(dict.fromkeys(panel_data["label"].tolist()))
-    out = pd.DataFrame(index=term_order, columns=model_order, dtype=object)
-    for _, row in panel_data.iterrows():
-        out.loc[row["label"], row["model"]] = fmt_coef(row["coef"], row["se"], row["p"])
-    for model in model_order:
-        model_rows = panel_data[panel_data["model"] == model]
-        if not model_rows.empty:
-            pseudo_r2 = model_rows["pseudo_r2"].iloc[0]
-            out.loc["Pseudo R2", model] = "" if pd.isna(pseudo_r2) else f"{pseudo_r2 * 100:.1f}%"
-            out.loc["Obs.", model] = fmt_int(model_rows["N"].iloc[0])
-    return out.fillna("")
 
 
 def write_cleaning_qa_outputs(
@@ -1676,7 +1708,7 @@ def write_cleaning_qa_outputs(
 
 
 # ---------------------------------------------------------------------------
-# PDF report
+# Figure export
 # ---------------------------------------------------------------------------
 
 
@@ -1710,592 +1742,114 @@ def save_fig(fig: plt.Figure, name: str) -> Path:
         return png_path
 
 
-def add_text_page(pdf: PdfPages, title: str, sections: list[tuple[str, str]]) -> None:
-    fig = plt.figure(figsize=PAGE)
-    fig.patch.set_facecolor("white")
-    y = 0.92
-    fig.text(0.06, y, title, fontsize=18, weight="bold", ha="left", va="top")
-    y -= 0.08
-    for heading, body in sections:
-        fig.text(0.06, y, heading, fontsize=12.5, weight="bold", ha="left", va="top")
-        y -= 0.035
-        for para in body.split("\n"):
-            if not para.strip():
-                y -= 0.018
-                continue
-            fig.text(0.075, y, wrap_text(para.strip(), 118), fontsize=9.5, ha="left", va="top", linespacing=1.25)
-            y -= 0.038 + 0.017 * max(0, math.ceil(len(para) / 118) - 1)
-        y -= 0.025
-    pdf.savefig(fig, bbox_inches="tight")
-    save_fig(fig, f"page_{title.lower().replace(' ', '_')[:45]}")
-    plt.close(fig)
-
-
-def add_table_page(
-    pdf: PdfPages,
-    title: str,
-    subtitle: str,
-    table: pd.DataFrame,
-    note: str,
-    filename: str,
-    font_size: float = 8.0,
-    scale_y: float = 1.25,
-) -> None:
-    fig = plt.figure(figsize=PAGE)
-    fig.patch.set_facecolor("white")
-    fig.text(0.05, 0.95, title, fontsize=14, weight="bold", ha="left", va="top")
-    fig.text(0.05, 0.91, subtitle, fontsize=9.5, ha="left", va="top")
-    ax = fig.add_axes([0.05, 0.14, 0.90, 0.70])
-    ax.axis("off")
-
-    display = table.copy()
-    display.insert(0, "Rows", display.index)
-    cell_text = display.values.tolist()
-    col_labels = display.columns.tolist()
-    tbl = ax.table(cellText=cell_text, colLabels=col_labels, cellLoc="center", loc="center")
-    tbl.auto_set_font_size(False)
-    tbl.set_fontsize(font_size)
-    tbl.scale(1.0, scale_y)
-
-    nrows = len(cell_text)
-    for (row, col), cell in tbl.get_celld().items():
-        cell.set_edgecolor("black")
-        cell.set_linewidth(0.65)
-        if row == 0:
-            cell.set_text_props(weight="bold")
-            cell.set_facecolor("#f2f2f2")
-            cell.visible_edges = "BT"
-        elif row == nrows:
-            cell.visible_edges = "B"
-        else:
-            cell.visible_edges = ""
-        if col == 0 and row > 0:
-            cell.set_text_props(weight="bold")
-
-    fig.text(0.05, 0.07, wrap_text(note, 132), fontsize=8.0, ha="left", va="top")
-    pdf.savefig(fig, bbox_inches="tight")
-    save_fig(fig, filename)
-    plt.close(fig)
-
-
-def add_existing_figure_page(pdf: PdfPages, fig: plt.Figure, filename: str) -> None:
-    pdf.savefig(fig, bbox_inches="tight")
-    save_fig(fig, filename)
-    plt.close(fig)
-
-
-def build_report(
-    df: pd.DataFrame,
-    summary: dict[str, float],
-    annual: pd.DataFrame,
-    table1: dict[tuple[int, int], dict[str, pd.DataFrame]],
-    table2: pd.DataFrame,
-    fig2a: pd.DataFrame,
-    fig2b: pd.DataFrame,
-    fig3: pd.DataFrame,
-    table3_results: pd.DataFrame,
-    stata_ran: bool,
-) -> None:
-    sample_1970 = df[(df["fyear"] >= 1970) & (df["fyear"] <= 2005)]
-    sample_1980 = df[(df["fyear"] >= 1980) & (df["fyear"] <= 2005)]
-    group_counts = (
-        sample_1980[["gvkey", "group_id"]]
-        .drop_duplicates()
-        .groupby("group_id")["gvkey"]
-        .nunique()
-        .rename("firms")
-        .to_dict()
-    )
-    stata_note = (
-        "Stata was run automatically from the configured executable path."
-        if stata_ran
-        else "The script exported the Stata data and do-file. Because STATA_EXE is not configured, Table 3 in this PDF uses the same logit specification estimated in Python; set STATA_EXE and rerun to refresh Stata output."
-    )
-
-    with PdfPages(REPORT_PDF) as pdf:
-        add_text_page(
-            pdf,
-            "Replication of Skinner (2008): Earnings, Dividends, and Repurchases",
-            [
-                (
-                    "Objective",
-                    "This report replicates the required 1970-2005 empirical results from Skinner (2008): Figure 1, Figure 2, Figure 3, Table 1, Table 2, and the optional Table 3 logit regressions.",
-                ),
-                (
-                    "Data",
-                    f"The input data are WRDS Compustat Fundamentals Annual files. The raw main file contains {summary['raw_rows']:,.0f} firm-year rows; ajex matched {summary['ajex_match_rate'] * 100:.1f}% of rows. After applying the paper's US industrial-firm screen, the working dataset contains {summary['clean_rows_before_year']:,.0f} firm-year rows and {summary['clean_firms_before_year']:,.0f} firms before the final year restrictions.",
-                ),
-                (
-                    "Sample Sizes",
-                    f"For 1970-2005, the cleaned sample contains {len(sample_1970):,.0f} firm-years and {sample_1970['gvkey'].nunique():,.0f} firms. For 1980-2005, it contains {len(sample_1980):,.0f} firm-years and {sample_1980['gvkey'].nunique():,.0f} firms.",
-                ),
-                (
-                    "Table 3 Status",
-                    stata_note,
-                ),
-            ],
-        )
-
-        add_text_page(
-            pdf,
-            "Data Cleaning and Variable Definitions",
-            [
-                (
-                    "Sample Screen",
-                    "The replication keeps consolidated, industrial-format, standard-format, USD Compustat annual observations and retains both active and inactive firms. It then removes firms not incorporated in the United States, financial firms with SIC 6000-6999, and utilities with SIC 4900-4999. The industry screen uses both sic and sich, and excludes a firm-year if either field falls in the excluded ranges.",
-                ),
-                (
-                    "Core Variables",
-                    "Dividends equal dvc, with missing values retained as missing for payout classification. Adjusted earnings equal ib - 0.6 x spi, following the paper's assumption that special items have a 40% tax rate. Total payout is computed only when dividends and net repurchases are both observable.",
-                ),
-                (
-                    "Net Repurchases",
-                    "Net repurchases follow the Skinner/Fama-French definition. If treasury stock is used, repurchases equal the increase in common treasury stock using an exact gvkey plus fyear-1 match. If current and lagged treasury stock are both observed as zero, the firm is treated as using the retirement method and repurchases equal prstkc - sstk only when both cash-flow fields are observed. Negative computed values are set to zero; uncomputable values remain missing.",
-                ),
-                (
-                    "Regression Variables",
-                    "Table 3 uses roa = oibdp / lag(at) with an exact gvkey plus fyear-1 match, cash = che / at, split-adjusted price = prcc_f / ajex, past stock return over the exact prior three fiscal years, and ESO dilution = xintopt / sale x past stock return.",
-                ),
-            ],
-        )
-
-        add_existing_figure_page(pdf, plot_figure1(annual), "figure1")
-
-        for window, data in table1.items():
-            start, end = window
-            add_table_page(
-                pdf,
-                f"Table 1, Panel A. Payout Policy Groups, {start}-{end}",
-                "Cells report number of firms and fraction of firms. Rows are years with net repurchases; columns are years with common dividends.",
-                data["count_display"],
-                "Notes: Firms are included if they have at least one Compustat observation in the window. Dividends and net repurchases are classified annually using positive payout amounts.",
-                f"table1_panel_a_{start}_{end}",
-                font_size=8.6,
-                scale_y=1.45,
-            )
-            add_table_page(
-                pdf,
-                f"Table 1, Panel B. Total Payout by Payout Policy Group, {start}-{end}",
-                "Cells report aggregate total payout in Compustat $ millions and fraction of total payout. Rows are years with net repurchases; columns are years with common dividends.",
-                data["payout_display"],
-                "Notes: Total payout equals dividends plus net repurchases, summed across all firm-years in each cell.",
-                f"table1_panel_b_{start}_{end}",
-                font_size=8.6,
-                scale_y=1.45,
-            )
-
-        add_table_page(
-            pdf,
-            "Table 2. Payout Policy Groups over 1980-2005",
-            "Cells report the number of firms. Rows are years with net repurchases; columns are years with common dividends.",
-            table2,
-            "Notes: Group definitions used in Figure 2, Figure 3, and Table 3 are based on this long-run 1980-2005 classification.",
-            "table2",
-            font_size=8.2,
-            scale_y=1.30,
-        )
-
-        add_text_page(
-            pdf,
-            "Long-Run Group Counts Used in Later Tests",
-            [
-                (
-                    "Groups",
-                    "\n".join(
-                        [
-                            f"Group I, Non-payers: {group_counts.get(1, 0):,.0f} firms.",
-                            f"Group II, regular dividends and regular repurchases: {group_counts.get(2, 0):,.0f} firms.",
-                            f"Group III, occasional repurchases only: {group_counts.get(3, 0):,.0f} firms.",
-                            f"Group IV, regular repurchases only: {group_counts.get(4, 0):,.0f} firms.",
-                            f"Group V, regular dividend-only firms: {group_counts.get(5, 0):,.0f} firms.",
-                        ]
-                    ),
-                ),
-                (
-                    "Interpretation",
-                    "These groups are not arbitrary year-by-year labels. They describe a firm's long-run payout behavior across 1980-2005, which is why the same grouping is reused in Figure 2, Figure 3, and the Table 3 regressions.",
-                ),
-            ],
-        )
-
-        add_existing_figure_page(pdf, plot_figure2(fig2a, fig2b), "figure2")
-        add_existing_figure_page(pdf, plot_figure3(fig3), "figure3")
-
-        table3_a = make_table3_display(table3_results, "Panel A")
-        table3_b = make_table3_display(table3_results, "Panel B")
-        add_table_page(
-            pdf,
-            "Table 3, Panel A. Repurchase Logit Regressions: Regular Dividend and Repurchase Firms",
-            "Dependent variable equals one for firm-years with positive net repurchases.",
-            table3_a,
-            "Notes: Coefficients are reported with standard errors in parentheses. * and ^ denote significance at the 1% and 5% levels. The embedded Stata do-code uses the same sample and variables.",
-            "table3_panel_a",
-            font_size=8.0,
-            scale_y=1.25,
-        )
-        add_table_page(
-            pdf,
-            "Table 3, Panel B. Repurchase Logit Regressions: Repurchase-Only Firms",
-            "Dependent variable equals one for firm-years with positive net repurchases. Regular dummy equals one for regular repurchasers.",
-            table3_b,
-            "Notes: Coefficients are reported with standard errors in parentheses. * and ^ denote significance at the 1% and 5% levels. ESO dilution is available mainly after 1995.",
-            "table3_panel_b",
-            font_size=8.0,
-            scale_y=1.18,
-        )
-
-        add_text_page(
-            pdf,
-            "Replication Notes and Economic Interpretation",
-            [
-                (
-                    "Main Patterns",
-                    "The replication is designed to verify the paper's central patterns rather than match every number exactly: dividends are smoother than earnings, repurchases become economically important after the early 1980s, and firms with both regular dividends and regular repurchases account for a large portion of aggregate earnings and payouts.",
-                ),
-                (
-                    "Economic Meaning of Cleaning Choices",
-                    "The financial, utility, and non-US exclusions align the sample with industrial operating firms whose payout policy is more comparable. Treating missing payout variables as zero follows the assignment requirement and is economically natural when a payout item is absent from the annual record.",
-                ),
-                (
-                    "Expected Sources of Differences",
-                    "Small numerical differences from the published paper can arise from WRDS historical database updates, field backfills, fiscal-year coverage, treatment of missing treasury stock data, and the availability of delisted or inactive firms in the current Compustat extract.",
-                ),
-            ],
-        )
-
-
-# ---------------------------------------------------------------------------
-# ElegantPaper LaTeX report builder
-# ---------------------------------------------------------------------------
-
-
-def latex_escape(value: object) -> str:
-    text = "" if pd.isna(value) else str(value)
-    replacements = {
-        "\\": r"\textbackslash{}",
-        "&": r"\&",
-        "%": r"\%",
-        "$": r"\$",
-        "#": r"\#",
-        "_": r"\_",
-        "{": r"\{",
-        "}": r"\}",
-        "~": r"\textasciitilde{}",
-    }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-    return text
-
-
-def latex_line_with_marker(line: str) -> str:
-    if line.endswith("*"):
-        return latex_escape(line[:-1]) + r"\textsuperscript{*}"
-    if line.endswith("^"):
-        return latex_escape(line[:-1]) + r"\textsuperscript{\(\dagger\)}"
-    return latex_escape(line)
-
-
-def latex_cell(value: object) -> str:
-    text = "" if pd.isna(value) else str(value)
-    parts = text.split("\n")
-    if len(parts) == 1:
-        return latex_line_with_marker(parts[0])
-    return r"\makecell{" + r" \\ ".join(latex_line_with_marker(p) for p in parts) + "}"
-
-
-def latex_table(
-    table: pd.DataFrame,
-    caption: str,
-    label: str,
-    note: str,
-    font_size: str = r"\scriptsize",
-    placement: str = "H",
-    numbered: bool = True,
-    landscape: bool = False,
-) -> str:
-    display = table.copy()
-    display.insert(0, "", display.index)
-    ncols = len(display.columns)
-    colspec = "l" + "c" * (ncols - 1)
-    header = " & ".join(latex_escape(c) for c in display.columns) + r" \\"
-    rows = []
-    for _, row in display.iterrows():
-        rows.append(" & ".join(latex_cell(v) for v in row.tolist()) + r" \\")
-    body = "\n".join(rows)
-    caption_cmd = r"\caption" if numbered else r"\caption*"
-    label_line = rf"\label{{{label}}}" if label else ""
-    table_tex = rf"""
-\begin{{table}}[{placement}]
-\centering
-{caption_cmd}{{{latex_escape(caption)}}}
-{label_line}
-{font_size}
-\begin{{threeparttable}}
-\renewcommand{{\arraystretch}}{{1.18}}
-\begin{{adjustbox}}{{max width=\textwidth}}
-\begin{{tabular}}{{{colspec}}}
-\toprule
-{header}
-\midrule
-{body}
-\bottomrule
-\end{{tabular}}
-\end{{adjustbox}}
-\begin{{tablenotes}}[flushleft]
-\footnotesize
-\item {latex_escape(note)}
-\end{{tablenotes}}
-\end{{threeparttable}}
-\end{{table}}
-"""
-    if landscape:
-        return "\n\\begin{landscape}\n" + table_tex + "\n\\end{landscape}\n"
-    return table_tex
-
-
-def latex_table1_panel(table: pd.DataFrame, panel_title: str, label: str, note: str, numbered: bool = True) -> str:
-    display = table.copy()
-    caption_cmd = r"\caption" if numbered else r"\caption*"
-    caption_text = (
-        "Table 1. Compustat工业公司按10年窗口支付政策分组，1980-2005"
-        if numbered
-        else "Table 1续"
-    )
-    label_line = rf"\label{{{label}}}" if label else ""
-    header = " & ".join(latex_escape(c) for c in display.columns) + r" \\"
-    rows = []
-    for row_label, row in display.iterrows():
-        rows.append(latex_cell(row_label) + " & " + " & ".join(latex_cell(v) for v in row.tolist()) + r" \\")
-    body = "\n".join(rows)
-    return rf"""
-\begin{{table}}[p]
-\centering
-{caption_cmd}{{{latex_escape(caption_text)}}}
-{label_line}
-\scriptsize
-\begin{{threeparttable}}
-\renewcommand{{\arraystretch}}{{1.08}}
-\begin{{tabular}}{{lccccc}}
-\toprule
-\multicolumn{{6}}{{l}}{{{latex_escape(panel_title)}}} \\
-\midrule
-Number of years of repurchases & \multicolumn{{5}}{{c}}{{Number of years of dividends}} \\
-\cmidrule(lr){{2-6}}
- & {header}
-\midrule
-{body}
-\bottomrule
-\end{{tabular}}
-\begin{{tablenotes}}[flushleft]
-\footnotesize
-\item {latex_escape(note)}
-\end{{tablenotes}}
-\end{{threeparttable}}
-\end{{table}}
-"""
-
-
-def latex_figure(path: Path, caption: str, label: str, width: str = r"0.95\textwidth") -> str:
-    rel = path.relative_to(OUTPUT_DIR).as_posix()
-    return rf"""
-\begin{{figure}}[H]
-\centering
-\includegraphics[width={width}]{{{rel}}}
-\caption{{{latex_escape(caption)}}}
-\label{{{label}}}
-\end{{figure}}
-"""
-
-
-def latex_paragraph(text: str) -> str:
-    return latex_escape(text).replace("\n", "\n\n")
-
-
-def build_latex_source(
-    df: pd.DataFrame,
-    summary: dict[str, float],
-    annual: pd.DataFrame,
-    table1: dict[tuple[int, int], dict[str, pd.DataFrame]],
-    table2: pd.DataFrame,
-    fig2a: pd.DataFrame,
-    fig2b: pd.DataFrame,
-    fig3: pd.DataFrame,
-    table3_results: pd.DataFrame,
-    sample_audit: pd.DataFrame,
-    group_diagnostics: pd.DataFrame,
-    stata_ran: bool,
-) -> str:
-    if not ELEGANT_CLASS.exists():
-        raise FileNotFoundError(
-            "elegantpaper.cls is missing. Download it from https://github.com/ElegantLaTeX/ElegantPaper."
-        )
-    shutil.copy2(ELEGANT_CLASS, OUTPUT_DIR / "elegantpaper.cls")
-
-    fig1_path = save_fig(plot_figure1(annual), "figure1")
-    fig2_path = save_fig(plot_figure2(fig2a, fig2b), "figure2")
-    fig3_path = save_fig(plot_figure3(fig3), "figure3")
-    plt.close("all")
-
-    sample_1970 = df[(df["fyear"] >= 1970) & (df["fyear"] <= 2005)]
-    sample_1980 = df[(df["fyear"] >= 1980) & (df["fyear"] <= 2005)]
-    table3_first_n = table3_results.groupby(["panel", "model"])["N"].first()
-    table3_has_empty_model = bool((table3_first_n.fillna(0) == 0).any())
-    if stata_ran:
-        stata_note = "Table 3由Stata通过已配置的可执行文件路径估计，并由Python读取Stata导出的结果写入报告。"
-    elif table3_has_empty_model:
-        stata_note = (
-            "至少一个Table 3模型没有可估计样本或因变量只有单一类别，因此脚本跳过Stata以避免失败或读取旧结果。"
-            "表中保留同一模型结构；可估计模型由Python同口径logit生成，样本不足的模型系数留空并报告Obs.。"
-        )
-    else:
-        stata_note = "Python已经导出Stata回归数据和do文件，但当前Python进程未发现可调用的Stata。因此Table 3暂以Python按同一logit设定估计的结果填入；若Stata路径可见，重新运行脚本即可刷新为Stata结果。"
-
-    table1_panel_a, table1_panel_b = build_table1_paper_panels(table1)
-    table2_display = table2.map(fmt_int)
-    table3_a = make_table3_display(table3_results, "Panel A")
-    table3_b = make_table3_display(table3_results, "Panel B")
-    table2_total = int(table2.loc["Sum", "Sum"])
-    table2_zero_div = int(table2.loc["Sum", "0"])
-
-    return rf"""
-% Based on the ElegantPaper template from https://github.com/ElegantLaTeX/ElegantPaper
-\documentclass[lang=cn,a4paper,11pt]{{elegantpaper}}
-\usepackage{{float}}
-\usepackage{{makecell}}
-\usepackage{{threeparttable}}
-\usepackage{{pdflscape}}
-\usepackage{{array}}
-\usepackage{{adjustbox}}
-\usepackage{{caption}}
-\graphicspath{{{{figures/}}}}
-
-\title{{Skinner (2008) 收益、股利与股票回购关系复现}}
-\author{{Python编程基础期末项目}}
-\institute{{Nankai University}}
-\version{{修订版复现报告}}
-\date{{2026年7月}}
-
-\begin{{document}}
-\maketitle
-
-\begin{{abstract}}
-本文复现Skinner (2008) 在1970-2005样本期内的核心结果，包括Figure 1、Figure 2、Figure 3以及Table 1、Table 2、Table 3。数据来自WRDS Compustat Fundamentals Annual。样本统一剔除非美国注册公司、金融公司和公用事业公司，并按照原文构造调整后收益、股利、净回购和长期支付政策分组。
-\keywords{{Skinner (2008), 股利, 股票回购, Compustat, 支付政策, 论文复现}}
-\end{{abstract}}
-
-\section{{数据、样本与变量定义}}
-主数据文件包含{summary['raw_rows']:,.0f}个Compustat公司年观测，\texttt{{ajex}}调整因子文件按\texttt{{gvkey}}和\texttt{{datadate}}的匹配率为{summary['ajex_match_rate'] * 100:.1f}\%。本文保留\texttt{{consol=C}}、\texttt{{indfmt=INDL}}、\texttt{{datafmt=STD}}、\texttt{{curcd=USD}}的年度数据，并保留美国注册公司。行业筛选先构造\texttt{{sic\_use}}：\texttt{{sich}}非缺失时使用历史行业代码，\texttt{{sich}}缺失时才用\texttt{{sic}}补充；随后按\texttt{{sic\_use}}剔除金融业6000-6999和公用事业4900-4999。active与inactive公司均保留，以避免幸存者偏差。最终1970-2005样本有{len(sample_1970):,.0f}个公司年和{sample_1970['gvkey'].nunique():,.0f}家公司；1980-2005样本有{len(sample_1980):,.0f}个公司年和{sample_1980['gvkey'].nunique():,.0f}家公司。
-
-股利定义为\texttt{{dvc}}，原始缺失值保留为缺失；股利状态只有在\texttt{{dvc}}可观测时才判定为0或1。调整后收益定义为\texttt{{ib}}减去0.6倍\texttt{{spi}}，其中\texttt{{spi}}缺失填0。净回购按Skinner/Fama-French口径构造：第一优先使用同一公司精确上一财政年度\texttt{{tstkc}}的增加额；当本年和上一财政年度\texttt{{tstkc}}均真实观测为0且现金流字段完整时，使用\texttt{{prstkc}}减去\texttt{{sstk}}作为明确的退休法；当连续\texttt{{tstkc}}不可观测但\texttt{{prstkc}}和\texttt{{sstk}}均可观测时，使用\texttt{{cashflow\_fallback}}作为现金流替代测量。若不存在可用测量，净回购和回购状态保持缺失；已成功构造出的负回购值置0。总支付等于可观测股利加可观测净回购。
-
-Table 3中，\texttt{{ROA}}为\texttt{{oibdp}}除以同一公司精确上一财政年度\texttt{{at}}，现金变量为当期\texttt{{che/at}}。拆股调整价格为\texttt{{prcc\_f/ajex}}，仅在价格和调整因子均有效时计算；三年股票收益按同一公司财政年度\texttt{{fyear-3}}的拆股调整价格精确匹配。ESO dilution定义为\texttt{{xintopt/sale}}乘以三年股票收益，且仅在1995年以后及所有输入有效时计算。
-
-\section{{总量趋势}}
-{latex_figure(fig1_path, "Compustat收益、特殊项目、股利和净回购总额，1970-2005。金额单位为百万美元。", "fig:figure1")}
-
-\section{{支付政策分类}}
-{latex_table1_panel(table1_panel_a, "Panel A: 各支付政策组中的Compustat公司数（括号内为比例）", "tab:table1", "行表示窗口内净回购发生年份数，列表示普通股股利支付年份数。括号内为该窗口内公司数占比。", numbered=True)}
-
-{latex_table1_panel(table1_panel_b, "Panel B: 各支付政策组的总支付金额（括号内为比例，金额单位为百万美元）", "", "总支付金额等于股利加净回购。括号内为该窗口内总支付金额占比。", numbered=False)}
-
-{latex_table(table2_display, "Table 2. 1980-2005长期支付政策分组", "tab:table2", "单元格报告公司数。行表示1980-2005年间发生净回购的年份数，列表示支付普通股股利的年份数。该长期分类用于Figure 2、Figure 3和Table 3。当前Table 2总公司数为" + fmt_int(table2_total) + "，0股利列为" + fmt_int(table2_zero_div) + "；原文对应数字为10,675和6,852。", font_size=r"\scriptsize")}
-
-\section{{长期分组的收益与亏损}}
-{latex_figure(fig2_path, "按长期支付组划分的总收益，1980-2005。金额单位为百万美元。", "fig:figure2")}
-{latex_figure(fig3_path, "各长期支付组报告亏损的公司比例，1980-2005。", "fig:figure3")}
-
-\section{{回购Logit回归}}
-{latex_escape(stata_note)}
-
-{latex_table(table3_a, "Table 3, Panel A. 经常支付股利且经常回购公司的回购Logit回归", "tab:table3a", "因变量在公司年净回购大于0时取1，净回购可观测且等于0时取0；净回购缺失的观测按各模型变量集删除。表中报告系数，括号内为标准误。*和dagger分别表示1%和5%显著性水平。", font_size=r"\scriptsize")}
-
-{latex_table(table3_b, "Table 3, Panel B. 仅回购公司的回购Logit回归", "tab:table3b", "因变量在公司年净回购大于0时取1，净回购可观测且等于0时取0；净回购缺失的观测按各模型变量集删除。Regular dummy在Group IV经常回购公司中取1，在Group III偶尔回购公司中取0。表中报告系数，括号内为标准误。*和dagger分别表示1%和5%显著性水平。", font_size=r"\scriptsize")}
-
-\section{{复现诊断}}
-本次修订采用论文近似口径C：Table 1的每个十年窗口、Table 2的1980-2005长窗口以及Group I-V分组，均要求公司在对应窗口内至少有1个清洗后公司年观测即可进入。支付年份数只累计可观察到的正股利或正净回购；某一年度支付状态缺失时，不把该年度改写为0，也不因该年度缺失而排除整家公司。因此，表中“0年支付”应理解为窗口内未观察到正支付记录，而不是证明所有缺失年份均无支付。
-
-净回购构造仍以库存股变动为第一优先、明确退休法为第二优先；当连续\texttt{{tstkc}}不可观测但\texttt{{prstkc}}和\texttt{{sstk}}均可观测时，本次修订允许使用\texttt{{cashflow\_fallback}}。这一路径能够恢复一部分由于库存股历史字段缺失而无法进入回购分类和Table 3的观测，但不会把原始缺失无条件填0，也不会把现金流替代测量解释为已确认的退休法。
-
-与原论文的差异主要来自三方面：第一，当前WRDS Compustat数据经过后续更新和历史回填，原始公司年宇宙与Skinner (2008)使用的数据版本不同；第二，本项目缺少CRSP/CCM层面的普通股、交易所和证券层筛选，因此公司数量可能偏大；第三，回购变量依赖\texttt{{tstkc}}、\texttt{{prstkc}}和\texttt{{sstk}}的历史可得性，现金流替代路径会改变0回购列、Group I-V和Table 3的有效样本量。附录诊断表用于说明这些差异，而不作为原论文编号表格。
-
-{latex_table(sample_audit, "样本清洗审计", "", "该表用于说明复现样本从原始数据到最终分析样本的逐步变化，不属于原论文编号表格。", font_size=r"\scriptsize", numbered=False)}
-
-{latex_table(group_diagnostics, "Group I-V样本诊断与描述性统计", "", "原文公司数来自Skinner (2008) Table 2及正文分组说明。当前统计基于清洗后的1980-2005样本；金额单位为百万美元。该表用于解释样本量、0股利列和回归结果差异，不属于原论文编号表格。", font_size=r"\tiny", placement="p", numbered=False, landscape=True)}
-
-\end{{document}}
-"""
-
-
-def compile_latex_report() -> None:
-    if not REPORT_TEX.exists():
-        raise FileNotFoundError(f"Missing LaTeX report source: {REPORT_TEX}")
-
-    latexmk = shutil.which("latexmk")
-    xelatex = shutil.which("xelatex")
-    if latexmk:
-        command = [
-            latexmk,
-            "-xelatex",
-            "-interaction=nonstopmode",
-            "-halt-on-error",
-            REPORT_TEX.name,
-        ]
-        subprocess.run(command, cwd=str(OUTPUT_DIR), check=True)
-    elif xelatex:
-        command = [xelatex, "-interaction=nonstopmode", "-halt-on-error", REPORT_TEX.name]
-        subprocess.run(command, cwd=str(OUTPUT_DIR), check=True)
-        subprocess.run(command, cwd=str(OUTPUT_DIR), check=True)
-    else:
-        raise RuntimeError("Neither latexmk nor xelatex was found on PATH.")
-
-    compiled = OUTPUT_DIR / REPORT_PDF.name
-    if not compiled.exists():
-        raise FileNotFoundError(f"LaTeX did not create expected PDF: {compiled}")
-    shutil.copy2(compiled, REPORT_PDF)
-
-
-def build_report(
-    df: pd.DataFrame,
-    summary: dict[str, float],
-    annual: pd.DataFrame,
-    table1: dict[tuple[int, int], dict[str, pd.DataFrame]],
-    table2: pd.DataFrame,
-    fig2a: pd.DataFrame,
-    fig2b: pd.DataFrame,
-    fig3: pd.DataFrame,
-    table3_results: pd.DataFrame,
-    sample_audit: pd.DataFrame,
-    group_diagnostics: pd.DataFrame,
-    stata_ran: bool,
-) -> None:
-    source = build_latex_source(
-        df,
-        summary,
-        annual,
-        table1,
-        table2,
-        fig2a,
-        fig2b,
-        fig3,
-        table3_results,
-        sample_audit,
-        group_diagnostics,
-        stata_ran,
-    )
-    REPORT_TEX.write_text(source, encoding="utf-8")
-    compile_latex_report()
-
-
 # ---------------------------------------------------------------------------
 # Main entrypoint
 # ---------------------------------------------------------------------------
+
+
+def write_python_handoff_artifacts(
+    clean: pd.DataFrame,
+    firm_groups: pd.DataFrame,
+    annual: pd.DataFrame,
+    table1: dict[tuple[int, int], dict[str, pd.DataFrame]],
+    table1_combined: pd.DataFrame,
+    table1_panel_a: pd.DataFrame,
+    table1_panel_b: pd.DataFrame,
+    table2: pd.DataFrame,
+    fig2a: pd.DataFrame,
+    fig2b: pd.DataFrame,
+    fig3: pd.DataFrame,
+    reg: pd.DataFrame,
+    sample_audit: pd.DataFrame,
+    group_diagnostics: pd.DataFrame,
+) -> None:
+    analysis_cols = [
+        "gvkey",
+        "datadate",
+        "fyear",
+        "sic",
+        "sich",
+        "sic_use",
+        "at",
+        "ceq",
+        "dvc",
+        "dividend",
+        "dividend_dummy",
+        "repurchase",
+        "repurchase_dummy",
+        "repurchase_source",
+        "total_payout",
+        "ib",
+        "special_items",
+        "earnings",
+        "adjusted_earnings",
+        "loss",
+        "group_id",
+        "group_name",
+        "roa",
+        "cash",
+        "past_stock_return",
+        "eso_dilution",
+    ]
+    available_analysis_cols = [col for col in analysis_cols if col in clean.columns]
+    analysis = clean.loc[clean["fyear"].between(1970, 2005), available_analysis_cols].copy()
+    analysis.to_csv(OUTPUT_DIR / "clean_analysis_firm_years_1970_2005.csv", index=False)
+
+    firm_groups.to_csv(OUTPUT_DIR / "firm_groups_1980_2005.csv", index=False)
+
+    manifest_rows = [
+        {"file": "clean_analysis_firm_years_1970_2005.csv", "purpose": "Clean firm-year analysis data for figures and checks."},
+        {"file": "firm_groups_1980_2005.csv", "purpose": "Firm-level long-run payout classifications used by Figure 2, Figure 3, Table 2, and Table 3."},
+        {"file": "tables/figure1_annual_aggregates.csv", "purpose": "Figure 1 plotting source data."},
+        {"file": "tables/figure2_panel_a_earnings.csv", "purpose": "Figure 2 Panel A source data built from the CRSP/CCM-screened Compustat sample."},
+        {"file": "tables/figure2_panel_b_earnings.csv", "purpose": "Figure 2 Panel B source data built from the CRSP/CCM-screened Compustat sample."},
+        {"file": "tables/figure3_loss_fractions.csv", "purpose": "Figure 3 plotting source data."},
+        {"file": "figures/figure1.png", "purpose": "Figure 1 rendered image for downstream assembly."},
+        {"file": "figures/figure1.pdf", "purpose": "Figure 1 vector figure for downstream assembly."},
+        {"file": "figures/figure2.png", "purpose": "Figure 2 rendered image for downstream assembly."},
+        {"file": "figures/figure2.pdf", "purpose": "Figure 2 vector figure for downstream assembly."},
+        {"file": "figures/figure3.png", "purpose": "Figure 3 rendered image for downstream assembly."},
+        {"file": "figures/figure3.pdf", "purpose": "Figure 3 vector figure for downstream assembly."},
+        {"file": "tables/table1_*", "purpose": "Table 1 counts, payouts, and display source panels."},
+        {"file": "tables/table2_counts_1980_2005.csv", "purpose": "Table 2 source counts."},
+        {"file": "stata/table3_regression_data.csv", "purpose": "Table 3 Stata regression input data."},
+        {"file": "stata/table3_regression_data.dta", "purpose": "Table 3 Stata regression input data in Stata format."},
+        {"file": "stata/table3_replication.do", "purpose": "Stata script for downstream Table 3 estimation."},
+        {"file": "python_stage_artifacts.xlsx", "purpose": "Compact workbook of Python-stage CSV source artifacts."},
+    ]
+    pd.DataFrame(manifest_rows).to_csv(OUTPUT_DIR / "manifest.csv", index=False)
+
+    workbook_path = OUTPUT_DIR / "python_stage_artifacts.xlsx"
+    sheets: list[tuple[str, pd.DataFrame]] = [
+        ("manifest", pd.DataFrame(manifest_rows)),
+        ("figure1", annual),
+        ("figure2_panel_a", fig2a),
+        ("figure2_panel_b", fig2b),
+        ("figure3", fig3),
+        ("table1_combined", table1_combined.reset_index()),
+        ("table1_panel_a", table1_panel_a.reset_index()),
+        ("table1_panel_b", table1_panel_b.reset_index()),
+        ("table2", table2.reset_index()),
+        ("sample_audit", sample_audit.reset_index()),
+        ("group_diagnostics", group_diagnostics.reset_index()),
+        ("table3_data_preview", reg.head(5000)),
+    ]
+    for (start, end), data in table1.items():
+        sheets.append((f"t1_counts_{start}_{end}", data["count_raw"].reset_index()))
+        sheets.append((f"t1_payouts_{start}_{end}", data["payout_raw"].reset_index()))
+
+    try:
+        with pd.ExcelWriter(workbook_path) as writer:
+            for sheet_name, frame in sheets:
+                frame.to_excel(writer, sheet_name=sheet_name[:31], index=False)
+    except Exception as exc:
+        print(f"Warning: could not export Excel workbook {workbook_path}: {exc}")
 
 
 def write_summary_file(
     summary: dict[str, float],
     df: pd.DataFrame,
     firm_groups: pd.DataFrame,
-    stata_ran: bool,
     table3_estimable: bool,
 ) -> None:
     lines = [
@@ -2318,6 +1872,16 @@ def write_summary_file(
         f"Firms with both sic and sich missing after USA screen: {summary['sic_sich_missing_firms']:,.0f}",
         f"Rows after US industrial screen: {summary['clean_rows_before_year']:,.0f}",
         f"Firms after US industrial screen: {summary['clean_firms_before_year']:,.0f}",
+        f"CCM link rows used: {summary['ccm_link_rows_used']:,.0f}",
+        f"CRSP name-history rows used after SHRCD/EXCHCD screen: {summary['crsp_name_rows_used']:,.0f}",
+        f"Rows after valid CCM link-date screen: {summary['crsp_ccm_linked_rows']:,.0f}",
+        f"Firms after valid CCM link-date screen: {summary['crsp_ccm_linked_firms']:,.0f}",
+        f"Rows after CRSP common-share exchange screen: {summary['crsp_ccm_screened_rows']:,.0f}",
+        f"Firms after CRSP common-share exchange screen: {summary['crsp_ccm_screened_firms']:,.0f}",
+        f"Past stock return price rows after format screen: {summary['past_return_price_format_rows']:,.0f}",
+        f"Past stock return price rows after industry screen: {summary['past_return_price_industry_rows']:,.0f}",
+        f"Past stock return price rows after final price-source screen: {summary['past_return_price_final_rows']:,.0f}",
+        f"Past stock return nonmissing adjusted-price rows in price source: {summary['past_return_price_adjusted_price_nonmissing']:,.0f}",
         f"Rows 1970-2005: {len(df[(df['fyear'] >= 1970) & (df['fyear'] <= 2005)]):,.0f}",
         f"Rows 1980-2005: {len(df[(df['fyear'] >= 1980) & (df['fyear'] <= 2005)]):,.0f}",
         "",
@@ -2328,15 +1892,16 @@ def write_summary_file(
         lines.append(f"  {gid}. {name}: {n:,.0f}")
     lines.append("")
     lines.append(f"All Table 3 models estimable: {table3_estimable}")
-    lines.append(f"Stata automatically run: {stata_ran}")
-    lines.append(f"Report: {REPORT_PDF}")
+    lines.append("Stata automatically run: False")
+    lines.append(f"Python handoff output: {OUTPUT_DIR}")
+    lines.append("Final PDF/report generation is intentionally outside this Python worktree.")
     (OUTPUT_DIR / "run_summary.txt").write_text("\n".join(lines), encoding="utf-8")
 
 
 def main() -> None:
     ensure_dirs()
-    main_df, ajex_df = read_inputs()
-    clean, summary = clean_and_construct(main_df, ajex_df)
+    main_df, ajex_df, ccm_link, crsp_names, past_stock_prices = read_inputs()
+    clean, summary = clean_and_construct(main_df, ajex_df, ccm_link, crsp_names, past_stock_prices)
     clean, firm_groups = add_long_run_groups(clean)
 
     annual = build_figure1(clean)
@@ -2346,52 +1911,49 @@ def main() -> None:
         (1990, 1999): table1_window(clean, 1990, 1999),
         (1995, 2004): table1_window(clean, 1995, 2004),
     }
+    table1_combined = build_table1_combined(table1)
+    table1_panel_a, table1_panel_b = build_table1_paper_panels(table1)
     table2 = build_table2(firm_groups)
     fig2a, fig2b = build_figure2(clean)
     fig3 = build_figure3(clean)
+    figure1 = plot_figure1(annual)
+    save_fig(figure1, "figure1")
+    plt.close(figure1)
+    figure2 = plot_figure2(fig2a, fig2b)
+    save_fig(figure2, "figure2")
+    plt.close(figure2)
+    figure3 = plot_figure3(fig3)
+    save_fig(figure3, "figure3")
+    plt.close(figure3)
     sample_audit = build_sample_audit_table(summary, clean)
     group_diagnostics = build_group_diagnostics(clean, firm_groups)
 
     reg = build_table3_data(clean)
+    (STATA_DIR / "table3_replication.do").write_text(stata_do_code(), encoding="utf-8")
     write_cleaning_qa_outputs(clean, firm_groups, table1, table2, reg)
     table3_estimable = table3_all_models_estimable(reg)
-    if table3_estimable:
-        stata_ran = write_and_maybe_run_stata()
-    else:
-        stata_ran = False
-        print("At least one Table 3 model has no estimable sample or one dependent-variable class; skipping Stata.")
-    python_results = python_table3_results(reg)
-    if stata_ran:
-        stata_results = stata_table3_results()
-        validate_stata_sample_counts(reg, stata_results)
-        table3_results = stata_results
-    else:
-        table3_results = python_results
-
-    build_report(
+    write_python_handoff_artifacts(
         clean,
-        summary,
+        firm_groups,
         annual,
         table1,
+        table1_combined,
+        table1_panel_a,
+        table1_panel_b,
         table2,
         fig2a,
         fig2b,
         fig3,
-        table3_results,
+        reg,
         sample_audit,
         group_diagnostics,
-        stata_ran,
     )
-    write_summary_file(summary, clean, firm_groups, stata_ran, table3_estimable)
-    print(f"Created {REPORT_PDF}")
-    print(f"Created support outputs under {OUTPUT_DIR}")
-    if not stata_ran:
-        if table3_estimable:
-            print(f"Stata do-file exported to {STATA_DIR / 'table3_replication.do'}")
-            print("Set STATA_EXE in replicate_skinner_2008.py and rerun if you want automatic Stata execution.")
-        else:
-            print("Stata was skipped because at least one Table 3 model has no estimable sample or one dependent-variable class.")
-            print(f"See {TABLE_DIR / 'qa_table3_regression_sample_counts.csv'} for model-level sample counts.")
+    write_summary_file(summary, clean, firm_groups, table3_estimable)
+    print(f"Created Python-stage handoff artifacts under {OUTPUT_DIR}")
+    print(f"Stata do-file exported to {STATA_DIR / 'table3_replication.do'}")
+    if not table3_estimable:
+        print("At least one Table 3 model has no estimable sample or one dependent-variable class.")
+        print(f"See {TABLE_DIR / 'qa_table3_regression_sample_counts.csv'} for model-level sample counts.")
 
 
 if __name__ == "__main__":

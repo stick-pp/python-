@@ -4,6 +4,14 @@ __pycache__/
 # Local WRDS data extracts. Keep these outside Git history.
 2.csv
 ajex.csv
+CCM Link Table.csv
+crsp_dse_names.csv
+Past stock return.csv
+sale.csv
+
+# Local reference PDFs and thread backups.
+WRDS Overview of CRSP U.S. Stock Database.pdf
+CONTEXT_BACKUP.md
 
 # Generated outputs.
 report_skinner_2008.pdf
