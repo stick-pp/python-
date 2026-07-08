@@ -8,6 +8,7 @@ CCM Link Table.csv
 crsp_dse_names.csv
 Past stock return.csv
 sale.csv
+monthly.csv
 
 # Local reference PDFs and thread backups.
 WRDS Overview of CRSP U.S. Stock Database.pdf
