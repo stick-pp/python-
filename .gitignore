@@ -2,27 +2,47 @@ __pycache__/
 .codex/
 
 # Local WRDS data extracts. Keep these outside Git history.
+maindata.csv
 2.csv
 ajex.csv
 CCM Link Table.csv
 crsp_dse_names.csv
+xintopt_1995_2005.csv
 Past stock return.csv
 sale.csv
 monthly.csv
+*.csv
+*.dta
+*.sas7bdat
+*.xlsx
+*.xls
 
 # Local reference PDFs and thread backups.
+*.pdf
 WRDS Overview of CRSP U.S. Stock Database.pdf
 CONTEXT_BACKUP.md
+Compustat Variable Translation.xls
+Python编程基础期末作业_2026.pdf
+elegantpaper-cn-template.tex
+elegantpaper.cls
 
 # Generated outputs.
 report_skinner_2008.pdf
 skinner_2008_outputs/
 shared_artifacts/
+diagnostics_outputs/
+python/diagnostics_outputs/
+no_crsp_ccm_table12_outputs/
+table3_robustness_2000_2005_outputs/
+table3_robustness_2000_2005_outputs_from_v2/
+xintopt_missing_audit_outputs/
 
 # Git worktrees created for task isolation.
 worktrees/
 
 # Common temporary files.
+*.tex
+*.cls
 *.tmp
 *.bak
 *.log

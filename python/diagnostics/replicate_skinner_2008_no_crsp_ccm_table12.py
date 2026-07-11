@@ -31,12 +31,45 @@ from matplotlib.ticker import FuncFormatter
 
 
 BASE_DIR = Path(__file__).resolve().parent
-PROJECT_DIR = BASE_DIR.parent.parent
+PYTHON_DIR = BASE_DIR.parent
+REPO_DIR = PYTHON_DIR.parent
+
+
+def infer_project_dir(repo_dir: Path) -> Path:
+    if repo_dir.parent.name.lower() == "worktrees":
+        candidate = repo_dir.parent.parent
+        if (candidate / "shared_artifacts").exists() or (candidate / "maindata.csv").exists():
+            return candidate
+    return repo_dir
+
+
+def first_path(candidates: list[Path]) -> Path:
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+PROJECT_DIR = infer_project_dir(REPO_DIR)
 SHARED_PYTHON_OUT = PROJECT_DIR / "shared_artifacts" / "python_out"
-MAIN_CSV = PROJECT_DIR / "maindata.csv"
-CCM_LINK_CSV = BASE_DIR / "CCM Link Table.csv"
-CRSP_DSE_NAMES_CSV = BASE_DIR / "crsp_dse_names.csv"
-OUTPUT_DIR = BASE_DIR / "no_crsp_ccm_table12_outputs"
+MAIN_CSV = first_path([PROJECT_DIR / "maindata.csv", REPO_DIR / "maindata.csv", REPO_DIR / "data" / "maindata.csv"])
+CCM_LINK_CSV = first_path(
+    [
+        REPO_DIR / "CCM Link Table.csv",
+        REPO_DIR / "data" / "CCM Link Table.csv",
+        PYTHON_DIR / "CCM Link Table.csv",
+        PROJECT_DIR / "CCM Link Table.csv",
+    ]
+)
+CRSP_DSE_NAMES_CSV = first_path(
+    [
+        REPO_DIR / "crsp_dse_names.csv",
+        REPO_DIR / "data" / "crsp_dse_names.csv",
+        PYTHON_DIR / "crsp_dse_names.csv",
+        PROJECT_DIR / "crsp_dse_names.csv",
+    ]
+)
+OUTPUT_DIR = PYTHON_DIR / "diagnostics_outputs" / "no_crsp_ccm_table12"
 
 
 

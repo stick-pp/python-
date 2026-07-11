@@ -17,10 +17,12 @@ import pandas as pd
 import statsmodels.api as sm
 
 
-BASE_DIR = Path(__file__).resolve().parent
-PROJECT_DIR = BASE_DIR.parent.parent
-MAIN_SCRIPT = BASE_DIR / "replicate_skinner_2008_V2.py"
-OUTPUT_DIR = BASE_DIR / "table3_robustness_2000_2005_outputs"
+DIAGNOSTICS_DIR = Path(__file__).resolve().parent
+PYTHON_DIR = DIAGNOSTICS_DIR.parent
+REPO_DIR = PYTHON_DIR.parent
+PROJECT_DIR = REPO_DIR.parent.parent if REPO_DIR.parent.name.lower() == "worktrees" else REPO_DIR
+MAIN_SCRIPT = PYTHON_DIR / "replicate_skinner_2008.py"
+OUTPUT_DIR = PYTHON_DIR / "diagnostics_outputs" / "table3_robustness_2000_2005"
 
 
 PANEL_SPECS = [
@@ -39,10 +41,10 @@ PANEL_SPECS = [
 ]
 
 
-def load_v2_module():
-    spec = importlib.util.spec_from_file_location("skinner_v2", MAIN_SCRIPT)
+def load_main_module():
+    spec = importlib.util.spec_from_file_location("skinner_main", MAIN_SCRIPT)
     module = importlib.util.module_from_spec(spec)
-    sys.modules["skinner_v2"] = module
+    sys.modules["skinner_main"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -163,10 +165,10 @@ def write_markdown(results: pd.DataFrame, audit: pd.DataFrame, path: Path) -> No
 
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    v2 = load_v2_module()
-    main_df, ccm_link, crsp_names = v2.read_inputs()
-    clean = v2.clean_and_construct(main_df, ccm_link, crsp_names)
-    clean, _firm_groups = v2.add_long_run_groups(clean)
+    main_module = load_main_module()
+    main_df, ccm_link, crsp_names = main_module.read_inputs()
+    clean = main_module.clean_and_construct(main_df, ccm_link, crsp_names)
+    clean, _firm_groups = main_module.add_long_run_groups(clean)
     reg = v2.build_table3_data(clean).reset_index(drop=False).rename(columns={"index": "row_id"})
 
     audit = pd.DataFrame(build_audit_rows(reg))

@@ -16,16 +16,18 @@ import numpy as np
 import pandas as pd
 
 
-BASE_DIR = Path(__file__).resolve().parent
-PROJECT_DIR = BASE_DIR.parent.parent
-TABLE_DIR = BASE_DIR / "xintopt_missing_audit_outputs"
-MAIN_SCRIPT = BASE_DIR / "replicate_skinner_2008_V2.py"
+DIAGNOSTICS_DIR = Path(__file__).resolve().parent
+PYTHON_DIR = DIAGNOSTICS_DIR.parent
+REPO_DIR = PYTHON_DIR.parent
+PROJECT_DIR = REPO_DIR.parent.parent if REPO_DIR.parent.name.lower() == "worktrees" else REPO_DIR
+TABLE_DIR = PYTHON_DIR / "diagnostics_outputs" / "xintopt_missing_audit"
+MAIN_SCRIPT = PYTHON_DIR / "replicate_skinner_2008.py"
 
 
-def load_v2_module():
-    spec = importlib.util.spec_from_file_location("skinner_v2", MAIN_SCRIPT)
+def load_main_module():
+    spec = importlib.util.spec_from_file_location("skinner_main", MAIN_SCRIPT)
     module = importlib.util.module_from_spec(spec)
-    sys.modules["skinner_v2"] = module
+    sys.modules["skinner_main"] = module
     spec.loader.exec_module(module)
     return module
 
@@ -82,7 +84,7 @@ def audit_chain(raw: pd.DataFrame, clean: pd.DataFrame) -> tuple[pd.DataFrame, p
     steps = [
         ("1995-2005 所有 Compustat 公司年", len(raw_1995_2005)),
         ("满足 C/INDL/STD、USD、USA、非金融非公用事业", count_rows(standard_industrial)),
-        ("Group II / III / IV（V2 当前 CRSP/CCM 主样本分组后）", count_rows(in_1995_2005 & target_groups)),
+        ("Group II / III / IV（当前 CRSP/CCM 主样本分组后）", count_rows(in_1995_2005 & target_groups)),
         ("repurchase_dummy 有效", count_rows(in_1995_2005 & target_groups & rep_valid)),
         ("ROA 有效", count_rows(in_1995_2005 & target_groups & rep_valid & roa_valid)),
         (
@@ -226,10 +228,10 @@ def write_markdown(total: pd.DataFrame, panel: pd.DataFrame, path: Path) -> None
 
 def main() -> None:
     TABLE_DIR.mkdir(parents=True, exist_ok=True)
-    v2 = load_v2_module()
-    raw, ccm_link, crsp_names = v2.read_inputs()
-    clean = v2.clean_and_construct(raw, ccm_link, crsp_names)
-    clean, _firm_groups = v2.add_long_run_groups(clean)
+    main_module = load_main_module()
+    raw, ccm_link, crsp_names = main_module.read_inputs()
+    clean = main_module.clean_and_construct(raw, ccm_link, crsp_names)
+    clean, _firm_groups = main_module.add_long_run_groups(clean)
 
     total, panel = audit_chain(raw, clean)
     total_path = TABLE_DIR / "xintopt_missing_source_audit_total.csv"
