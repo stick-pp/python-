@@ -9,6 +9,7 @@ ajex.csv
 report_skinner_2008.pdf
 skinner_2008_outputs/
 shared_artifacts/
+build_report/
 
 # Git worktrees created for task isolation.
 worktrees/
