@@ -1,14 +1,21 @@
 __pycache__/
 .codex/
 
-# Local WRDS data extracts. Keep these outside Git history.
-2.csv
-ajex.csv
+# Local WRDS/CRSP/CCM data extracts. Keep these outside Git history.
+*.csv
+*.dta
+*.xls
+*.xlsx
+
+# Reference papers and course materials are local-only.
+*.pdf
 
 # Generated outputs.
 report_skinner_2008.pdf
 skinner_2008_outputs/
 shared_artifacts/
+build_report/
+*_outputs/
 
 # Git worktrees created for task isolation.
 worktrees/
@@ -26,3 +33,5 @@ worktrees/
 *.out
 *.run.xml
 *.xdv
+*.png
+*.zip
