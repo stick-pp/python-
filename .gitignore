@@ -4,11 +4,13 @@ __pycache__/
 # Local WRDS/CRSP/CCM data extracts. Keep these outside Git history.
 *.csv
 *.dta
+*.sas7bdat
 *.xls
 *.xlsx
 
-# Reference papers and course materials are local-only.
+# Reference papers, course materials, and local thread backups.
 *.pdf
+CONTEXT_BACKUP.md
 
 # Generated outputs.
 report_skinner_2008.pdf
@@ -16,6 +18,12 @@ skinner_2008_outputs/
 shared_artifacts/
 build_report/
 *_outputs/
+diagnostics_outputs/
+python/diagnostics_outputs/
+no_crsp_ccm_table12_outputs/
+table3_robustness_2000_2005_outputs/
+table3_robustness_2000_2005_outputs_from_v2/
+xintopt_missing_audit_outputs/
 
 # Git worktrees created for task isolation.
 worktrees/
